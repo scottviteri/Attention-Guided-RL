@@ -161,9 +161,13 @@ def compute_kl_divergence(old_probs: torch.Tensor, new_probs: torch.Tensor) -> t
     # Add small epsilon for numerical stability
     eps = 1e-8
     old_probs = torch.clamp(old_probs, min=eps)
-    new_probs = torch.clamp(new_probs, min=eps)
     
-    kl_div = F.kl_div(new_probs.log(), old_probs, reduction='batchmean')
+    # Apply log_softmax to new_probs directly for numerical stability
+    # instead of computing softmax first and then taking the log
+    log_new_probs = F.log_softmax(new_probs, dim=-1)
+    
+    # Use KL divergence formula with log_probs and probs directly
+    kl_div = F.kl_div(log_new_probs, old_probs, reduction='batchmean')
     return kl_div
 
 def format_query_prompt(context: str, instructions: str, article_title: str = None) -> str:

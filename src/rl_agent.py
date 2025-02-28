@@ -6,6 +6,8 @@ import os
 import torch
 import numpy as np
 import logging
+import json
+import time
 from typing import Dict, List, Tuple, Any, Optional, Union
 from collections import deque
 
@@ -16,6 +18,7 @@ from src.config import (
     WARMUP_EPISODES,
     REWARD_SYSTEM_PROMPT
 )
+from src.embeddings import compute_embedding, batch_compute_embeddings
 from src.utils import (
     softmax,
     sample_from_distribution,
@@ -23,8 +26,7 @@ from src.utils import (
     compute_kl_divergence
 )
 from src.model import LanguageModel
-from src.data import KeyValueDatabase
-from src.embeddings import ada_embedding
+from src.data import KeyValuePair
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -37,7 +39,7 @@ class TrajectoryCollector:
     def __init__(
         self, 
         model: LanguageModel,
-        database: KeyValueDatabase,
+        database: List[KeyValuePair],
         temperature: float = 1.0
     ):
         """
@@ -45,34 +47,48 @@ class TrajectoryCollector:
         
         Args:
             model: Language model for query generation
-            database: Key-value database for retrieving content
+            database: List of KeyValuePair objects
             temperature: Temperature for controlling exploration
         """
         self.model = model
         self.database = database
+        self.original_database = database.copy()  # Store a copy for reset
         self.temperature = temperature
+        self.title = f"Wikipedia Article"  # Default title
+        
+        # Get article title if available
+        if len(database) > 0 and hasattr(database[0], 'title'):
+            self.title = database[0].title
         
         logger.info(f"Initialized TrajectoryCollector with temperature: {temperature}")
     
-    def collect_trajectory(self) -> List[Dict[str, Any]]:
+    def collect_trajectory(self, verbose: bool = False) -> List[Dict[str, Any]]:
         """
         Collect a single trajectory by rolling out the policy.
+        
+        Args:
+            verbose: Whether to enable verbose logging
         
         Returns:
             List of steps in the trajectory
         """
         # Reset the database
-        self.database.reset()
+        self.reset()
         
         # Get the article title
-        article_title = self.database.title
+        article_title = self.title
         
         # Initialize empty context and trajectory
         context = ""
         trajectory = []
         
         # Continue until all key-value pairs are selected
-        while not self.database.is_empty():
+        step_count = 0
+        while not self.is_empty():
+            step_count += 1
+            if verbose:
+                logger.debug(f"Trajectory step {step_count}: Generating query...")
+            
             # Generate query based on current context
             query = self.model.generate_query(
                 context=context,
@@ -81,11 +97,18 @@ class TrajectoryCollector:
                 article_title=article_title
             )
             
+            if verbose:
+                logger.debug(f"Generated query: {query}")
+            
             # Compute query embedding
-            query_embedding = ada_embedding(query)
+            # Explicitly specify this is a query embedding (is_query=True)
+            query_embedding = compute_embedding(query, is_query=True)
+            
+            if verbose:
+                logger.debug(f"Query embedding computed - shape: {query_embedding.shape}")
             
             # Compute similarities with available keys
-            available_key_embeddings = self.database.get_available_key_embeddings()
+            available_key_embeddings = self.get_available_key_embeddings()
             similarities = {}
             
             for key_id, key_embedding in available_key_embeddings.items():
@@ -100,8 +123,14 @@ class TrajectoryCollector:
             selected_idx = sample_from_distribution(probs)
             selected_key_id = list(similarities.keys())[selected_idx]
             
+            if verbose:
+                logger.debug(f"Selected key ID: {selected_key_id} (probability: {probs[selected_idx]:.4f})")
+            
             # Get corresponding key-value pair
-            key, value = self.database.select_key(selected_key_id)
+            key, value = self.select_key(selected_key_id)
+            
+            if verbose:
+                logger.debug(f"Retrieved value: {value[:50]}...")
             
             # Append to context
             if context:
@@ -121,13 +150,57 @@ class TrajectoryCollector:
             })
         
         return trajectory
+
+    def reset(self):
+        """Reset the database to its original state."""
+        self.database = self.original_database.copy()
     
-    def collect_batch_trajectories(self, batch_size: int = BATCH_SIZE) -> List[List[Dict[str, Any]]]:
+    def is_empty(self) -> bool:
+        """Check if the database is empty."""
+        return len(self.database) == 0
+    
+    def get_available_key_embeddings(self) -> Dict[str, np.ndarray]:
+        """Get embeddings for available keys."""
+        embeddings = {}
+        for i, kv_pair in enumerate(self.database):
+            key_id = kv_pair.key_id if kv_pair.key_id else f"key_{i}"
+            embeddings[key_id] = kv_pair.key_embedding
+        return embeddings
+    
+    def select_key(self, key_id: str) -> Tuple[str, str]:
+        """Select a key-value pair and remove it from the database."""
+        # Find the key-value pair with the given key_id
+        selected_idx = -1
+        for i, kv_pair in enumerate(self.database):
+            current_key_id = kv_pair.key_id if kv_pair.key_id else f"key_{i}"
+            if current_key_id == key_id:
+                selected_idx = i
+                break
+        
+        if selected_idx == -1:
+            raise ValueError(f"Key ID {key_id} not found in database")
+        
+        # Get the key-value pair
+        kv_pair = self.database.pop(selected_idx)
+        
+        # Convert token IDs to text using the tokenizer if available
+        if hasattr(self.model, 'tokenizer') and hasattr(kv_pair, 'key_tokens') and hasattr(kv_pair, 'value_tokens'):
+            key = self.model.tokenizer.decode(kv_pair.key_tokens)
+            value = self.model.tokenizer.decode(kv_pair.value_tokens)
+        else:
+            # Fallback if tokenizer is not available or tokens are not available
+            key = f"Key {key_id}"
+            value = f"Value for {key_id}"
+        
+        return key, value
+    
+    def collect_batch_trajectories(self, batch_size: int = BATCH_SIZE, verbose: bool = False) -> List[List[Dict[str, Any]]]:
         """
         Collect multiple trajectories in parallel.
         
         Args:
             batch_size: Number of trajectories to collect
+            verbose: Whether to enable verbose logging
             
         Returns:
             List of trajectories
@@ -136,8 +209,10 @@ class TrajectoryCollector:
         # In a more advanced implementation, this could be parallelized
         trajectories = []
         
-        for _ in range(batch_size):
-            trajectory = self.collect_trajectory()
+        for i in range(batch_size):
+            if verbose:
+                logger.debug(f"Collecting trajectory {i+1}/{batch_size}")
+            trajectory = self.collect_trajectory(verbose=verbose)
             trajectories.append(trajectory)
         
         return trajectories
@@ -186,7 +261,7 @@ class ReinforcementLearner:
     
     def compute_trajectory_reward(self, trajectory: List[Dict[str, Any]]) -> float:
         """
-        Compute reward for a trajectory.
+        Compute reward for a single trajectory.
         
         Args:
             trajectory: List of steps in the trajectory
@@ -196,6 +271,22 @@ class ReinforcementLearner:
         """
         return self.model.calculate_trajectory_reward(
             trajectory=trajectory,
+            system_prompt=REWARD_SYSTEM_PROMPT,
+            baseline_model=self.baseline_model
+        )
+
+    def compute_batch_trajectory_rewards(self, trajectories: List[List[Dict[str, Any]]]) -> List[float]:
+        """
+        Compute rewards for multiple trajectories in a batched manner for efficiency.
+        
+        Args:
+            trajectories: List of trajectories, where each trajectory is a list of steps
+            
+        Returns:
+            List of reward values
+        """
+        return self.model.calculate_batch_trajectory_rewards(
+            trajectories=trajectories,
             system_prompt=REWARD_SYSTEM_PROMPT,
             baseline_model=self.baseline_model
         )
@@ -355,60 +446,61 @@ class ReinforcementLearner:
 def train_episode(
     collector: TrajectoryCollector,
     learner: ReinforcementLearner,
-    batch_size: int = BATCH_SIZE
+    batch_size: int = BATCH_SIZE,
+    verbose: bool = False
 ) -> Dict[str, Any]:
     """
-    Train for one episode (batch of trajectories).
+    Run a single training episode.
     
     Args:
         collector: Trajectory collector
         learner: Reinforcement learner
-        batch_size: Number of trajectories per batch
+        batch_size: Number of trajectories to collect per batch
+        verbose: Whether to enable verbose logging
         
     Returns:
-        Dictionary with training metrics
+        Dictionary with episode metrics
     """
     # Collect trajectories
-    trajectories = collector.collect_batch_trajectories(batch_size)
+    trajectories = collector.collect_batch_trajectories(batch_size, verbose)
     
-    # Compute rewards
-    rewards = [learner.compute_trajectory_reward(trajectory) for trajectory in trajectories]
+    # Compute rewards for all trajectories in batched manner
+    rewards = learner.compute_batch_trajectory_rewards(trajectories)
     
     # Update policy
     metrics = learner.update_policy(trajectories, rewards)
     
-    # Return metrics and trajectory info
     return {
-        **metrics,
         "trajectories": trajectories,
-        "rewards": rewards
+        "rewards": rewards,
+        "metrics": metrics
     }
 
 def run_training(
-    model: LanguageModel,
-    database: KeyValueDatabase,
-    num_episodes: int,
+    model: 'LanguageModel',
+    database: 'List[KeyValuePair]',
+    num_episodes: int = 50,
     batch_size: int = BATCH_SIZE,
-    learning_rate: float = 1e-5,
+    learning_rate: float = 0.0001,
     kl_weight: float = KL_WEIGHT,
-    checkpoint_dir: str = "checkpoints",
-    save_interval: int = 10
-) -> Dict[str, Any]:
+    disable_checkpoints: bool = False,
+    verbose: bool = False
+) -> List[float]:
     """
-    Run full training loop.
+    Run training for the reinforcement learning agent.
     
     Args:
         model: Language model to train
-        database: Key-value database
+        database: List of KeyValuePair objects
         num_episodes: Number of episodes to train
         batch_size: Number of trajectories per batch
         learning_rate: Learning rate for optimizer
         kl_weight: Weight for KL divergence regularization
-        checkpoint_dir: Directory to save checkpoints
-        save_interval: Save checkpoint every N episodes
+        disable_checkpoints: Whether to disable saving model checkpoints
+        verbose: Whether to enable verbose logging
         
     Returns:
-        Dictionary with training history
+        List of rewards for each episode
     """
     # Initialize baseline model
     baseline_model = None  # Or implement a baseline model
@@ -424,40 +516,44 @@ def run_training(
         kl_weight=kl_weight
     )
     
-    # Training history
-    history = {
-        "losses": [],
-        "rewards": [],
-        "filtered_counts": [],
-        "grad_norms": []
-    }
+    # Track rewards
+    episode_rewards = []
     
     # Training loop
     for episode in range(num_episodes):
-        logger.info(f"Episode {episode+1}/{num_episodes}")
+        if verbose:
+            logger.debug(f"Starting episode {episode+1}/{num_episodes}")
+        else:
+            logger.info(f"Episode {episode+1}/{num_episodes}")
         
         # Train one episode
-        result = train_episode(collector, learner, batch_size)
+        result = train_episode(collector, learner, batch_size, verbose)
         
         # Log metrics
         logger.info(f"  Loss: {result['loss']:.4f}")
         logger.info(f"  Mean reward: {result['reward_mean']:.4f}")
         logger.info(f"  Filtered trajectories: {result['filtered_count']}/{batch_size}")
         
-        # Update history
-        history["losses"].append(result["loss"])
-        history["rewards"].extend(result["rewards"])
-        history["filtered_counts"].append(result["filtered_count"])
-        if "grad_norm" in result:
-            history["grad_norms"].append(result["grad_norm"])
+        if verbose:
+            logger.debug(f"  Detailed metrics:")
+            logger.debug(f"    Reward std: {result.get('reward_std', 0):.4f}")
+            logger.debug(f"    Gradient norm: {result.get('grad_norm', 0):.4f}")
+            logger.debug(f"    Individual rewards: {result['rewards']}")
         
-        # Save checkpoint
-        if (episode + 1) % save_interval == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f"model_episode_{episode+1}")
-            model.save_checkpoint(checkpoint_path)
+        # Track rewards for this episode
+        episode_rewards.append(result['reward_mean'])
+        
+        # Log to wandb if available
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({
+                    "loss": result["loss"],
+                    "reward_mean": result["reward_mean"],
+                    "filtered_count": result["filtered_count"],
+                    "grad_norm": result.get("grad_norm", 0)
+                }, step=episode)
+        except ImportError:
+            pass
     
-    # Save final checkpoint
-    final_checkpoint_path = os.path.join(checkpoint_dir, "model_final")
-    model.save_checkpoint(final_checkpoint_path)
-    
-    return history 
+    return episode_rewards 

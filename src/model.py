@@ -9,9 +9,7 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    GenerationConfig,
-    PreTrainedModel,
-    PreTrainedTokenizer
+    GenerationConfig
 )
 
 from src.config import (
@@ -300,6 +298,36 @@ class LanguageModel:
             return normalized_log_probs.mean().item()
         
         return log_probs.mean().item()
+    
+    def calculate_batch_trajectory_rewards(
+        self,
+        trajectories: List[List[Dict[str, Any]]],
+        system_prompt: str,
+        baseline_model: Optional["LanguageModel"] = None
+    ) -> List[float]:
+        """
+        Calculate rewards for multiple trajectories in a batched manner.
+        
+        Args:
+            trajectories: List of trajectories, where each trajectory is a list of steps
+            system_prompt: System prompt for reward calculation
+            baseline_model: Optional baseline model for normalization
+            
+        Returns:
+            List of average log probability rewards for each trajectory
+        """
+        rewards = []
+        
+        # Process in batches (can be optimized further with true batching if needed)
+        for trajectory in trajectories:
+            reward = self.calculate_trajectory_reward(
+                trajectory=trajectory,
+                system_prompt=system_prompt,
+                baseline_model=baseline_model
+            )
+            rewards.append(reward)
+            
+        return rewards
     
     def save_checkpoint(self, path: str) -> None:
         """

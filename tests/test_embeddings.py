@@ -124,7 +124,7 @@ class TestEmbeddingService:
         key_embeddings = {
             "key1": np.array([1.0, 0.0, 0.0]),  # Perfect match
             "key2": np.array([0.0, 1.0, 0.0]),  # Orthogonal (no match)
-            "key3": np.array([0.5, 0.5, 0.0])   # Partial match
+            "key3": np.array([0.7071067811865475, 0.7071067811865475, 0.0])   # Partial match
         }
         
         # Compute similarities
@@ -133,7 +133,7 @@ class TestEmbeddingService:
         # Verify results
         assert similarities["key1"] == 1.0
         assert similarities["key2"] == 0.0
-        assert similarities["key3"] == 0.5
+        assert np.isclose(similarities["key3"], 0.7071067811865475)  # ~0.707 for normalized vectors
 
 
 def test_initialize_and_get_embedding_service():

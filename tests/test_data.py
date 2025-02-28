@@ -7,281 +7,589 @@ import pytest
 import json
 import numpy as np
 from unittest.mock import patch, MagicMock, mock_open
+import unittest
+from pathlib import Path
+import torch
+import random
 
 # Import the module to test
 from src.data import (
-    WikiArticleProcessor,
-    KeyValueDatabase,
-    load_wikipedia_article
+    KeyValuePair,
+    load_wikipedia_article,
+    create_wiki_dataset_iterator,
+    next_article,
+    fetch_from_wikipedia_api,
+    tokenize_article_into_chunks,
+    create_key_value_pairs_from_chunks,
+    process_article_text,
+    process_article_for_batch,
+    process_next_article,
+    load_random_wikipedia_article,
+    process_articles_stream,
+    batch_process_articles
 )
 
 
-class TestWikiArticleProcessor:
-    """Test cases for the WikiArticleProcessor class."""
-    
-    @pytest.fixture
-    def mock_tokenizer(self):
-        """Create a mock tokenizer."""
-        mock = MagicMock()
-        mock.encode.return_value = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        mock.decode.side_effect = lambda ids, **kwargs: "Text for token IDs: " + str(ids)
-        mock.pad_token_id = 0
-        return mock
-    
-    @patch("src.data.AutoTokenizer")
-    def test_initialization(self, mock_auto_tokenizer, mock_tokenizer, tmp_path):
-        """Test WikiArticleProcessor initialization."""
-        # Setup mocks
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+class TestWikiArticleProcessor(unittest.TestCase):
+    def setUp(self):
+        # Create mock tokenizer
+        self.mock_tokenizer = MagicMock()
+        self.mock_tokenizer.encode.return_value = list(range(100))  # 100 tokens
+        self.mock_tokenizer.decode.side_effect = lambda x: f"Text for tokens {x[:5]}..."
+        self.mock_tokenizer.pad_token_id = 0
         
-        # Create processor
-        cache_dir = str(tmp_path / "test_cache")
-        processor = WikiArticleProcessor(model_name="test-model", cache_dir=cache_dir)
-        
-        # Verify
-        mock_auto_tokenizer.from_pretrained.assert_called_once_with("test-model")
-        assert processor.tokenizer == mock_tokenizer
-        assert processor.cache_dir == cache_dir
-        assert os.path.exists(cache_dir)
+        # Mock article content
+        self.article_content = "This is a test article content for unit testing."
     
-    @patch("src.data.AutoTokenizer")
-    @patch("src.data.requests.get")
-    @patch("src.data.load_dataset")
-    def test_fetch_wikipedia_article(self, mock_load_dataset, mock_get, mock_auto_tokenizer, mock_tokenizer, tmp_path):
-        """Test fetching a Wikipedia article."""
-        # Setup mocks
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
-        
-        # Mock Wikipedia API as fallback
+    @patch('src.data.requests.get')
+    def test_fetch_from_wikipedia_api(self, mock_get):
+        # Mock the response
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "query": {
                 "pages": {
                     "12345": {
-                        "extract": "This is a test article from Wikipedia API."
+                        "extract": "Test content from Wikipedia API"
                     }
                 }
             }
         }
         mock_get.return_value = mock_response
         
-        # Mock the dataset iterator to return a few test articles
+        # Call the function
+        result = fetch_from_wikipedia_api("Test Article")
+        
+        # Verify result
+        self.assertEqual(result, "Test content from Wikipedia API")
+        mock_get.assert_called_once()
+    
+    def test_tokenize_article_into_chunks(self):
+        # Call the function
+        chunks = tokenize_article_into_chunks(
+            self.article_content,
+            self.mock_tokenizer,
+            chunk_size=20,
+            max_chunks=3
+        )
+        
+        # Verify results
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(len(chunks[0]), 20)
+        self.assertTrue(isinstance(chunks[0], torch.Tensor))
+        self.mock_tokenizer.encode.assert_called_once_with(self.article_content, add_special_tokens=False)
+    
+    def test_create_key_value_pairs_from_chunks(self):
+        # Create test chunks as torch tensors
+        chunks = [
+            torch.tensor(list(range(10)), dtype=torch.long),
+            torch.tensor(list(range(10, 20)), dtype=torch.long),
+            torch.tensor(list(range(20, 30)), dtype=torch.long),
+            torch.tensor(list(range(30, 40)), dtype=torch.long),
+            torch.tensor(list(range(40, 50)), dtype=torch.long),
+            torch.tensor(list(range(50, 60)), dtype=torch.long)
+        ]
+        
+        # Test with consecutive pairs (non-random) with overlapping mode
+        pairs = create_key_value_pairs_from_chunks(
+            chunks=chunks, 
+            max_pairs=2, 
+            non_overlapping=False,
+            random_selection=False  # Use consecutive pairs from the beginning
+        )
+        
+        # Verify results for consecutive pairs
+        self.assertEqual(len(pairs), 2)
+        self.assertTrue(torch.equal(pairs[0][0], chunks[0]))
+        self.assertTrue(torch.equal(pairs[0][1], chunks[1]))
+        self.assertTrue(torch.equal(pairs[1][0], chunks[1]))
+        self.assertTrue(torch.equal(pairs[1][1], chunks[2]))
+        
+        # Test with consecutive pairs (non-random) with non-overlapping mode
+        pairs_non_overlap = create_key_value_pairs_from_chunks(
+            chunks=chunks, 
+            max_pairs=2,
+            non_overlapping=True,
+            random_selection=False  # Use consecutive pairs from the beginning
+        )
+        
+        # In non-overlapping mode, we should get the first two pairs: (0,1) and (2,3)
+        self.assertEqual(len(pairs_non_overlap), 2)
+        self.assertTrue(torch.equal(pairs_non_overlap[0][0], chunks[0]))
+        self.assertTrue(torch.equal(pairs_non_overlap[0][1], chunks[1]))
+        self.assertTrue(torch.equal(pairs_non_overlap[1][0], chunks[2]))
+        self.assertTrue(torch.equal(pairs_non_overlap[1][1], chunks[3]))
+        
+        # Test with random selection of consecutive pairs
+        with unittest.mock.patch('random.shuffle') as mock_shuffle:
+            # Mock random.shuffle to reverse the list (to ensure we get a different order)
+            def reverse_list(lst):
+                lst.reverse()
+            mock_shuffle.side_effect = reverse_list
+            
+            # Test with non-overlapping mode
+            random_pairs = create_key_value_pairs_from_chunks(
+                chunks=chunks,
+                max_pairs=2,
+                non_overlapping=True,
+                random_selection=True
+            )
+            
+            # With our mock shuffle, we should get the last two pairs: (2,3) and (0,1) in reverse order
+            self.assertEqual(len(random_pairs), 2)
+            # Since we reversed the list, we should get chunks (4,5) and (2,3)
+            self.assertTrue(torch.equal(random_pairs[0][0], chunks[4]))
+            self.assertTrue(torch.equal(random_pairs[0][1], chunks[5]))
+            self.assertTrue(torch.equal(random_pairs[1][0], chunks[2]))
+            self.assertTrue(torch.equal(random_pairs[1][1], chunks[3]))
+    
+    @patch('src.data.batch_compute_embeddings')
+    @patch('src.data.tokenize_article_into_chunks')
+    def test_process_article_text(self, mock_tokenize_chunks, mock_batch_embeddings):
+        # Mock chunks as PyTorch tensors - need 4 chunks to ensure 2 pairs with non_overlapping=True
+        mock_chunks = [
+            torch.tensor(list(range(10)), dtype=torch.long),
+            torch.tensor(list(range(10, 20)), dtype=torch.long),
+            torch.tensor(list(range(20, 30)), dtype=torch.long),
+            torch.tensor(list(range(30, 40)), dtype=torch.long)
+        ]
+        mock_tokenize_chunks.return_value = mock_chunks
+        
+        # Mock embeddings
+        mock_batch_embeddings.return_value = [np.array([0.1, 0.2, 0.3]) for _ in range(2)]
+        
+        # Call the function
+        result = process_article_text(
+            self.article_content,
+            self.mock_tokenizer,
+            max_pairs=2,
+            compute_embeddings=True
+        )
+        
+        # Verify results
+        self.assertEqual(result["title"], "Wikipedia Article")
+        self.assertEqual(len(result["pairs"]), 2)
+        self.assertEqual(len(result["key_embeddings"]), 2)
+        # Verify each pair is a tuple of strings (decoded tokens)
+        for pair in result["pairs"]:
+            self.assertTrue(isinstance(pair[0], str))
+            self.assertTrue(isinstance(pair[1], str))
+        mock_batch_embeddings.assert_called_once()
+    
+    @patch('src.data.next_article')
+    @patch('src.data.AutoTokenizer')
+    @patch('src.data.tokenize_article_into_chunks')
+    def test_process_next_article(self, mock_tokenize_chunks, mock_tokenizer_class, mock_next_article):
+        # Mock chunks as PyTorch tensors - need 4 chunks to ensure 2 pairs with non_overlapping=True
+        mock_chunks = [
+            torch.tensor(list(range(10)), dtype=torch.long),
+            torch.tensor(list(range(10, 20)), dtype=torch.long),
+            torch.tensor(list(range(20, 30)), dtype=torch.long),
+            torch.tensor(list(range(30, 40)), dtype=torch.long)
+        ]
+        mock_tokenize_chunks.return_value = mock_chunks
+        
+        # Mock tokenizer
+        mock_tokenizer_class.from_pretrained.return_value = self.mock_tokenizer
+        
+        # Mock article
+        mock_next_article.return_value = ("Test Title", self.article_content)
+        
+        # Call the function
+        result = process_next_article(MagicMock(), max_pairs=2)
+        
+        # Verify results
+        self.assertEqual(result["title"], "Test Title")
+        self.assertEqual(len(result["pairs"]), 2)
+        # Verify each pair is a tuple of strings (decoded tokens)
+        for pair in result["pairs"]:
+            self.assertTrue(isinstance(pair[0], str))
+            self.assertTrue(isinstance(pair[1], str))
+    
+    @patch('src.data.process_article_for_batch')
+    @patch('src.data.fetch_from_wikipedia_api')
+    @patch('src.data.next_article')
+    @patch('src.data.create_wiki_dataset_iterator')
+    @patch('src.data.AutoTokenizer')
+    def test_load_wikipedia_article(self, mock_tokenizer_class, mock_create_iterator, mock_next_article, mock_fetch_api, mock_process_article_for_batch):
+        """Test the load_wikipedia_article function."""
+        # Mock tokenizer
+        mock_tokenizer = MagicMock()
+        mock_tokenizer_class.from_pretrained.return_value = mock_tokenizer
+        
+        # Mock article fetch from API directly returns content instead of empty string
+        mock_fetch_api.return_value = "Test article content from API"
+        
+        # Mock article processing with PyTorch tensor
+        mock_kv_pair = KeyValuePair(
+            key_id="key_0",
+            key_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            value_tokens=torch.tensor([4, 5, 6], dtype=torch.long),
+            key_embedding=np.array([0.1, 0.2, 0.3])
+        )
+        mock_process_article_for_batch.return_value = [mock_kv_pair]
+        
+        # Load article
+        result = load_wikipedia_article(title="test article", max_pairs=10)
+        
+        # Verify
+        mock_fetch_api.assert_called_once_with("test article")
+        mock_create_iterator.assert_not_called()  # Should not be called since API fetch succeeded
+        mock_next_article.assert_not_called()  # Should not be called since API fetch succeeded
+        
+        # Should be called once for API path
+        mock_process_article_for_batch.assert_called_once()
+        
+        # Check the result
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], KeyValuePair)
+        self.assertTrue(isinstance(result[0].key_tokens, torch.Tensor))
+        self.assertTrue(isinstance(result[0].value_tokens, torch.Tensor))
+    
+    @patch('src.data.load_dataset')
+    def test_real_wikipedia_dataset(self, mock_load_dataset):
+        """Test with a simulated Wikipedia dataset"""
+        # Create a mock dataset
         mock_dataset = MagicMock()
         mock_dataset.__iter__.return_value = iter([
-            {"title": "Some other article", "text": "Content of some other article"},
-            {"title": "Artificial intelligence", "text": "AI is the simulation of human intelligence in machines"},
-            {"title": "Yet another article", "text": "Content of yet another article"}
+            {"title": "Test Article", "text": "Test content"}
         ])
         mock_load_dataset.return_value = mock_dataset
         
-        # Create processor
-        processor = WikiArticleProcessor(model_name="test-model")
+        # Create an iterator from the mock dataset
+        iterator = create_wiki_dataset_iterator(streaming=True)
         
-        # Fetch article using mocked dataset
-        article = processor.fetch_wikipedia_article("Artificial intelligence")
+        # Get the first article
+        title, content = next_article(iterator)
         
-        # Verify article contains content
-        assert len(article) > 0
-        assert "ai is the simulation" in article.lower()
+        # Verify we got something
+        self.assertEqual(title, "Test Article")
+        self.assertEqual(content, "Test content")
         
-        # Test fallback to Wikipedia API when article not found
-        # Reset the mock dataset iterator for the second test
-        mock_dataset.__iter__.return_value = iter([
-            {"title": "Some other article", "text": "Content of some other article"},
-            {"title": "Yet another article", "text": "Content of yet another article"}
-        ])
+        # Process just one tokenization step to verify it works
+        tokenizer = self.mock_tokenizer
+        tokenizer.encode.return_value = list(range(1000))  # simulate real tokens
         
-        article = processor.fetch_wikipedia_article("ThisIsAVeryUnlikelyWikipediaArticleTitleThatShouldNotExist12345")
+        chunks = tokenize_article_into_chunks(
+            content,
+            tokenizer,
+            chunk_size=20,
+            max_chunks=3
+        )
         
-        # Verify Wikipedia API was used as fallback
-        mock_get.assert_called_once()
-        assert "test article from wikipedia api" in article.lower()
+        # Verify chunks
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(len(chunks[0]), 20)
+        self.assertTrue(isinstance(chunks[0], torch.Tensor))
+
+    def test_tokenize_article_too_short(self):
+        # Mock a very short article
+        short_article = "Short text"
+        self.mock_tokenizer.encode.return_value = list(range(10))  # Only 10 tokens
+        
+        # Test with skip_if_too_short=True (default)
+        with self.assertRaises(ValueError):
+            # Try to get too many chunks from a short article
+            list(tokenize_article_into_chunks(
+                short_article,
+                self.mock_tokenizer,
+                chunk_size=20,
+                max_chunks=3
+            ))
+        
+        # Test with skip_if_too_short=False
+        chunks = tokenize_article_into_chunks(
+            short_article,
+            self.mock_tokenizer,
+            chunk_size=5,
+            max_chunks=3,
+            skip_if_too_short=False
+        )
+        
+        # Should only get 2 chunks, not 3
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks[0]), 5)
+        self.assertTrue(isinstance(chunks[0], torch.Tensor))
     
-    @patch("src.data.AutoTokenizer")
-    def test_tokenize_article_into_chunks(self, mock_auto_tokenizer, mock_tokenizer):
-        """Test tokenizing article into chunks."""
-        # Setup mocks
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
-        mock_tokenizer.encode.return_value = list(range(1, 20))  # 19 tokens
-        
-        # Create processor
-        processor = WikiArticleProcessor(model_name="test-model")
-        
-        # Tokenize into chunks
-        chunks = processor.tokenize_article_into_chunks("Test article text", chunk_size=5, max_chunks=5)
-        
-        # Verify
-        mock_tokenizer.encode.assert_called_once_with("Test article text", add_special_tokens=False)
-        assert len(chunks) == 4  # Should create 4 chunks of size 5 from 19 tokens
-        assert chunks[0] == [1, 2, 3, 4, 5]
-        assert chunks[1] == [6, 7, 8, 9, 10]
-        assert chunks[2] == [11, 12, 13, 14, 15]
-        assert chunks[3] == [16, 17, 18, 19, 0]  # Last chunk padded
-    
-    @patch("src.data.AutoTokenizer")
-    def test_create_key_value_pairs_from_chunks(self, mock_auto_tokenizer, mock_tokenizer):
-        """Test creating key-value pairs from chunks."""
-        # Setup mocks
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
-        
-        # Create processor
-        processor = WikiArticleProcessor(model_name="test-model")
-        
-        # Create pairs
-        chunks = [
-            [1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 10],
-            [11, 12, 13, 14, 15],
-            [16, 17, 18, 19, 20]
+    @patch('src.data.process_article_for_batch')
+    @patch('src.data.next_article')
+    def test_process_articles_stream(self, mock_next_article, mock_process_article_for_batch):
+        """Test the process_articles_stream function."""
+        # Configure mock to return a sequence of articles
+        mock_next_article.side_effect = [
+            # First article
+            ("Article 1", "This is a test article content"),
+            # Second article
+            ("Article 2", "Another article with content"),
+            # End of iteration
+            StopIteration()
         ]
-        pairs = processor.create_key_value_pairs_from_chunks(chunks, max_pairs=2)
         
-        # Verify
-        assert len(pairs) == 2
-        assert pairs[0] == ([1, 2, 3, 4, 5], [6, 7, 8, 9, 10])
-        assert pairs[1] == ([6, 7, 8, 9, 10], [11, 12, 13, 14, 15])
-    
-    @patch("src.data.AutoTokenizer")
-    @patch("src.data.batch_ada_embeddings")
-    def test_process_article(self, mock_batch_embeddings, mock_auto_tokenizer, mock_tokenizer):
-        """Test processing a complete article."""
-        # Setup mocks
-        mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
-        mock_batch_embeddings.return_value = [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        # Mock article processing with PyTorch tensors
+        mock_kv_pair1 = KeyValuePair(
+            key_id="key_0",
+            key_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            value_tokens=torch.tensor([4, 5, 6], dtype=torch.long),
+            key_embedding=np.array([0.1, 0.2, 0.3])
+        )
+        mock_kv_pair2 = KeyValuePair(
+            key_id="key_1",
+            key_tokens=torch.tensor([7, 8, 9], dtype=torch.long),
+            value_tokens=torch.tensor([10, 11, 12], dtype=torch.long),
+            key_embedding=np.array([0.4, 0.5, 0.6])
+        )
         
-        # Mock processor methods
-        processor = WikiArticleProcessor(model_name="test-model")
-        processor.fetch_wikipedia_article = MagicMock(return_value="Test article content")
-        processor.tokenize_article_into_chunks = MagicMock(return_value=[
-            [1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 10],
-            [11, 12, 13, 14, 15]
+        # First article returns two pairs, second article returns one pair
+        mock_process_article_for_batch.side_effect = [
+            [mock_kv_pair1, mock_kv_pair2],  # First article
+            [mock_kv_pair2]  # Second article
+        ]
+        
+        # Create a mock wiki iterator and tokenizer
+        mock_iterator = MagicMock()
+        mock_tokenizer = MagicMock()
+        
+        # Call the function
+        stream = process_articles_stream(
+            mock_iterator,
+            mock_tokenizer,
+            chunk_size=20,
+            min_chunks_per_article=1
+        )
+        
+        # Get the first article from the stream
+        result1 = next(stream)
+        
+        # Verify the first article result
+        self.assertIsInstance(result1, list)
+        self.assertEqual(len(result1), 2)
+        self.assertIsInstance(result1[0], KeyValuePair)
+        self.assertEqual(result1[0].key_id, "key_0")
+        self.assertTrue(isinstance(result1[0].key_tokens, torch.Tensor))
+        self.assertTrue(isinstance(result1[0].value_tokens, torch.Tensor))
+        
+        # Get the second article from the stream
+        result2 = next(stream)
+        
+        # Verify the second article result
+        self.assertIsInstance(result2, list)
+        self.assertEqual(len(result2), 1)
+        self.assertIsInstance(result2[0], KeyValuePair)
+        self.assertEqual(result2[0].key_id, "key_1")
+        self.assertTrue(isinstance(result2[0].key_tokens, torch.Tensor))
+        self.assertTrue(isinstance(result2[0].value_tokens, torch.Tensor))
+        
+        # Verify StopIteration at end of stream
+        with self.assertRaises(StopIteration):
+            next(stream)
+            
+        # Verify the call sequence - called for first article, second article, and StopIteration attempt
+        self.assertEqual(mock_next_article.call_count, 3)
+
+    @patch('src.data.process_articles_stream')
+    def test_batch_process_articles(self, mock_process_articles_stream):
+        """Test the batch_process_articles function"""
+        # Create mock KeyValuePair objects with PyTorch tensors
+        kv_pair1 = KeyValuePair(
+            key_id="key_0",
+            key_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            value_tokens=torch.tensor([4, 5, 6], dtype=torch.long),
+            key_embedding=np.array([0.1, 0.2, 0.3])
+        )
+        kv_pair2 = KeyValuePair(
+            key_id="key_1",
+            key_tokens=torch.tensor([7, 8, 9], dtype=torch.long),
+            value_tokens=torch.tensor([10, 11, 12], dtype=torch.long),
+            key_embedding=np.array([0.4, 0.5, 0.6])
+        )
+        kv_pair3 = KeyValuePair(
+            key_id="key_2",
+            key_tokens=torch.tensor([13, 14, 15], dtype=torch.long),
+            value_tokens=torch.tensor([16, 17, 18], dtype=torch.long),
+            key_embedding=np.array([0.7, 0.8, 0.9])
+        )
+        
+        # Configure mock to return a stream of articles with KeyValuePair objects
+        mock_process_articles_stream.return_value = iter([
+            # First article with two pairs
+            [kv_pair1, kv_pair2],
+            # Second article with one pair
+            [kv_pair3],
+            # No more articles - this is crucial to avoid infinite loops
+            []
         ])
-        processor.create_key_value_pairs_from_chunks = MagicMock(return_value=[
-            ([1, 2, 3, 4, 5], [6, 7, 8, 9, 10]),
-            ([6, 7, 8, 9, 10], [11, 12, 13, 14, 15])
-        ])
         
-        # Process article
-        data = processor.process_article(title="Test Article", max_pairs=2)
+        # Create mock iterator and tokenizer
+        mock_iterator = MagicMock()
+        mock_tokenizer = MagicMock()
         
-        # Verify
-        assert processor.fetch_wikipedia_article.called
-        assert processor.tokenize_article_into_chunks.called
-        assert processor.create_key_value_pairs_from_chunks.called
-        assert mock_batch_embeddings.called
-        
-        assert data["title"] == "Test Article"
-        assert len(data["pairs"]) == 2
-        assert len(data["key_embeddings"]) == 2
+        # Mock the next_article function to return appropriate articles and then stop iteration
+        with patch('src.data.next_article') as mock_next_article:
+            # Configure mock to return two articles and then stop
+            mock_next_article.side_effect = [
+                ("Article 1", "Content 1"),
+                ("Article 2", "Content 2"),
+                StopIteration()
+            ]
+            
+            # Also mock tokenize_article_into_chunks to return valid chunks
+            with patch('src.data.tokenize_article_into_chunks') as mock_tokenize:
+                mock_tokenize.return_value = [torch.tensor([1, 2, 3]) for _ in range(20)]  # 20 chunks
+                
+                # Mock process_article_for_batch to return our predefined KeyValuePair objects
+                with patch('src.data.process_article_for_batch') as mock_process:
+                    mock_process.side_effect = [
+                        [kv_pair1, kv_pair2],  # First article
+                        [kv_pair3]  # Second article
+                    ]
+                    
+                    # Call the function
+                    batch_gen = batch_process_articles(
+                        wiki_iterator=mock_iterator,
+                        tokenizer=mock_tokenizer,
+                        batch_size=2,
+                        chunk_size=10,
+                        min_chunks_per_article=1
+                    )
+                    
+                    # Get the first batch (should contain the first two pairs)
+                    batch1 = next(batch_gen)
+                    
+                    # Verify first batch
+                    self.assertIsInstance(batch1, list)
+                    self.assertEqual(len(batch1), 2)
+                    self.assertIsInstance(batch1[0], KeyValuePair)
+                    self.assertEqual(batch1[0].key_id, "key_0")
+                    self.assertEqual(batch1[1].key_id, "key_1")
+                    self.assertTrue(isinstance(batch1[0].key_tokens, torch.Tensor))
+                    self.assertTrue(isinstance(batch1[0].value_tokens, torch.Tensor))
+                    
+                    # Get the second batch (should contain the third pair)
+                    batch2 = next(batch_gen)
+                    
+                    # Verify second batch
+                    self.assertIsInstance(batch2, list)
+                    self.assertEqual(len(batch2), 1)
+                    self.assertIsInstance(batch2[0], KeyValuePair)
+                    self.assertEqual(batch2[0].key_id, "key_2")
+                    self.assertTrue(isinstance(batch2[0].key_tokens, torch.Tensor))
+                    self.assertTrue(isinstance(batch2[0].value_tokens, torch.Tensor))
+                    
+                    # Verify there are no more batches
+                    with self.assertRaises(StopIteration):
+                        next(batch_gen)
+                    
+                    # Verify the calls were made with the expected arguments
+                    mock_next_article.assert_called()
+                    mock_tokenize.assert_called()
+                    mock_process.assert_called()
 
+    @patch('src.data.process_article_for_batch')
+    @patch('src.data.next_article')
+    @patch('src.data.create_wiki_dataset_iterator')
+    @patch('src.data.AutoTokenizer')
+    def test_load_random_wikipedia_article(self, mock_tokenizer_class, mock_create_iterator, mock_next_article, mock_process_article_for_batch):
+        """Test the load_random_wikipedia_article function."""
+        # Mock tokenizer
+        mock_tokenizer = MagicMock()
+        mock_tokenizer_class.from_pretrained.return_value = mock_tokenizer
+        
+        # Mock dataset search
+        mock_iterator = MagicMock()
+        mock_create_iterator.return_value = mock_iterator
+        
+        # Mock finding articles
+        mock_next_article.side_effect = [
+            ("Short Article", "Short text"),  # First article is too short
+            ("Good Article", "This is a good article with enough content"),  # Second article is good
+        ]
+        
+        # Mock article processing with PyTorch tensors
+        # First call returns empty list (too short), second call returns a list of KeyValuePair objects
+        mock_kv_pair = KeyValuePair(
+            key_id="key_0",
+            key_tokens=torch.tensor([1, 2, 3], dtype=torch.long),
+            value_tokens=torch.tensor([4, 5, 6], dtype=torch.long),
+            key_embedding=np.array([0.1, 0.2, 0.3])
+        )
+        mock_process_article_for_batch.side_effect = [
+            [],  # First article is too short
+            [mock_kv_pair]  # Second article is good
+        ]
+        
+        # Load random article
+        result = load_random_wikipedia_article(max_pairs=10)
+        
+        # Verify
+        mock_create_iterator.assert_called_once()
+        self.assertEqual(mock_next_article.call_count, 2)
+        self.assertEqual(mock_process_article_for_batch.call_count, 2)
+        
+        # Check the result
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], KeyValuePair)
+        self.assertEqual(result[0].key_id, "key_0")
+        self.assertTrue(isinstance(result[0].key_tokens, torch.Tensor))
+        self.assertTrue(isinstance(result[0].value_tokens, torch.Tensor))
 
-class TestKeyValueDatabase:
-    """Test cases for the KeyValueDatabase class."""
-    
-    @pytest.fixture
-    def sample_data(self):
-        """Create sample data for testing."""
-        return {
-            "title": "Test Article",
-            "pairs": [
-                ("Key 1", "Value 1"),
-                ("Key 2", "Value 2"),
-                ("Key 3", "Value 3")
-            ],
-            "key_embeddings": {
-                "key_0": [0.1, 0.2, 0.3],
-                "key_1": [0.4, 0.5, 0.6],
-                "key_2": [0.7, 0.8, 0.9]
-            }
-        }
-    
-    def test_initialization(self, sample_data):
-        """Test KeyValueDatabase initialization."""
-        # Create database
-        db = KeyValueDatabase(sample_data)
+    @patch('src.data.batch_compute_embeddings')
+    @patch('src.data.tokenize_article_into_chunks')
+    def test_process_article_for_batch(self, mock_tokenize_chunks, mock_batch_embeddings):
+        """Test the process_article_for_batch function."""
+        # Set up mock tokenizer
+        tokenizer = MagicMock()
+        tokenizer.encode.return_value = list(range(100))  # 100 tokens
+        tokenizer.decode.return_value = "Test text"
         
-        # Verify
-        assert db.title == "Test Article"
-        assert len(db.pairs) == 3
-        assert len(db.key_embeddings) == 3
-        assert len(db.available_keys) == 3
-        assert isinstance(db.key_embeddings["key_0"], np.ndarray)
-    
-    def test_get_available_key_embeddings(self, sample_data):
-        """Test getting available key embeddings."""
-        # Create database
-        db = KeyValueDatabase(sample_data)
+        # Create mock chunks as PyTorch tensors
+        mock_chunks = [torch.tensor(list(range(i, i+10)), dtype=torch.long) for i in range(0, 100, 10)]
+        mock_tokenize_chunks.return_value = mock_chunks
         
-        # Get embeddings
-        embeddings = db.get_available_key_embeddings()
+        # Mock batch_compute_embeddings function - return 5 embeddings
+        # Each pair uses 2 chunks, so with 10 chunks we get 5 pairs
+        mock_batch_embeddings.return_value = [np.array([0.1, 0.2, 0.3])] * 5
         
-        # Verify
-        assert len(embeddings) == 3
-        assert "key_0" in embeddings
-        assert isinstance(embeddings["key_0"], np.ndarray)
-    
-    def test_select_key(self, sample_data):
-        """Test selecting a key-value pair."""
-        # Create database
-        db = KeyValueDatabase(sample_data)
+        # Call the function with min_chunks_per_article=2
+        result = process_article_for_batch(
+            title="Test Article",
+            article_text="This is a test article with sufficient content",
+            tokenizer=tokenizer,
+            chunk_size=10,
+            min_chunks_per_article=2
+        )
         
-        # Select a key
-        key, value = db.select_key("key_1")
+        # Verify results - we get 5 pairs (non-overlapping) from 10 chunks
+        self.assertIsInstance(result, list)
+        # Each pair needs 2 chunks, so with 10 chunks we get 5 pairs
+        self.assertEqual(len(result), 5)
         
-        # Verify
-        assert key == "Key 2"
-        assert value == "Value 2"
-        assert "key_1" not in db.available_keys
-        assert len(db.available_keys) == 2
-    
-    def test_reset(self, sample_data):
-        """Test resetting the database."""
-        # Create database
-        db = KeyValueDatabase(sample_data)
+        # Verify the structure of KeyValuePair objects
+        for i, pair in enumerate(result):
+            self.assertIsInstance(pair, KeyValuePair)
+            self.assertEqual(pair.key_id, f"key_{i}")
+            self.assertEqual(len(pair.key_tokens), 10)
+            self.assertEqual(len(pair.value_tokens), 10)
+            self.assertIsInstance(pair.key_embedding, np.ndarray)
+            self.assertTrue(isinstance(pair.key_tokens, torch.Tensor))
+            self.assertTrue(isinstance(pair.value_tokens, torch.Tensor))
         
-        # Select a key and then reset
-        db.select_key("key_1")
-        db.reset()
+        # Verify tokenizer and embedding calls
+        mock_tokenize_chunks.assert_called_once()
+        # Should call batch_compute_embeddings once with all key texts
+        mock_batch_embeddings.assert_called_once()
         
-        # Verify
-        assert "key_1" in db.available_keys
-        assert len(db.available_keys) == 3
-    
-    def test_is_empty(self, sample_data):
-        """Test checking if database is empty."""
-        # Create database
-        db = KeyValueDatabase(sample_data)
+        # Test with a short article
+        # Set up mock to return only 1 chunk for the short article test
+        mock_tokenize_chunks.side_effect = [ValueError("Article is too short")]
         
-        # Initially not empty
-        assert not db.is_empty()
+        result_short = process_article_for_batch(
+            title="Short Article",
+            article_text="Too short",
+            tokenizer=tokenizer,
+            chunk_size=10,
+            min_chunks_per_article=2
+        )
         
-        # Select all keys
-        db.select_key("key_0")
-        db.select_key("key_1")
-        db.select_key("key_2")
-        
-        # Should be empty now
-        assert db.is_empty()
-
-
-@patch("src.data.WikiArticleProcessor")
-def test_load_wikipedia_article(mock_processor_class):
-    """Test the load_wikipedia_article helper function."""
-    # Setup mocks
-    mock_processor = MagicMock()
-    mock_processor_class.return_value = mock_processor
-    
-    # Mock processor methods
-    mock_processor.process_article.return_value = {
-        "title": "Test Article",
-        "pairs": [("Key", "Value")],
-        "key_embeddings": {"key_0": [0.1, 0.2, 0.3]}
-    }
-    
-    # Load article
-    database = load_wikipedia_article(title="Test Article", max_pairs=10)
-    
-    # Verify
-    assert mock_processor.process_article.called
-    assert isinstance(database, KeyValueDatabase) 
+        # Should return an empty list (need at least 2 pairs)
+        self.assertEqual(result_short, []) 

@@ -2,6 +2,11 @@
 Configuration parameters for the Attention-Guided RL project.
 """
 
+import os
+
+# API keys
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
 # Model parameters
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
 EMBEDDING_MODEL = "text-embedding-ada-002"
@@ -20,7 +25,7 @@ VALUE_TOKEN_COUNT = 40  # Fixed token count for values
 
 # Wikipedia article parameters
 WIKI_ARTICLE_TITLE = "Artificial intelligence"  # Default article to use
-MAX_PAIRS = 50  # Maximum number of key-value pairs to extract
+MAX_PAIRS = 10  # Maximum number of key-value pairs to extract
 
 # Special tokens
 USER_START = "<|start_header_id|>user<|end_header_id|>"
@@ -30,9 +35,10 @@ EOT_TOKEN = "<|eot_id|>"
 
 # Instructions for query generation
 QUERY_INSTRUCTIONS = """
-Based on the context above, generate a query that would help you learn the most 
-from the available information. Your query should help select the most informative 
-next piece of content from the article.
+Now, generate a single specific question that would help you learn the most 
+important information from this article that hasn't been covered yet. Create a 
+focused, direct question without any preamble or explanation.
+Generate your question immediately:
 """
 
 # System prompt for reward calculation
@@ -42,7 +48,7 @@ Evaluate the log probability of the following query-value sequence.
 
 # Logging parameters
 LOG_INTERVAL = 10  # Log metrics every N episodes
-SAVE_MODEL_INTERVAL = 100  # Save model checkpoint every N episodes
+SAVE_MODEL_INTERVAL = 0  # Set to 0 to disable checkpointing by default
 WANDB_PROJECT = "attention-guided-rl"  # W&B project name
 WANDB_ENTITY = None  # W&B entity name
 
