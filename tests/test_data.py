@@ -145,7 +145,6 @@ class TestWikiArticleProcessor(unittest.TestCase):
     @patch('src.data.batch_compute_embeddings')
     @patch('src.data.tokenize_article_into_chunks')
     def test_process_article_text(self, mock_tokenize_chunks, mock_batch_embeddings):
-        # Mock chunks as PyTorch tensors - need 4 chunks to ensure 2 pairs with non_overlapping=True
         mock_chunks = [
             torch.tensor(list(range(10)), dtype=torch.long),
             torch.tensor(list(range(10, 20)), dtype=torch.long),
@@ -153,26 +152,27 @@ class TestWikiArticleProcessor(unittest.TestCase):
             torch.tensor(list(range(30, 40)), dtype=torch.long)
         ]
         mock_tokenize_chunks.return_value = mock_chunks
-        
-        # Mock embeddings
+
         mock_batch_embeddings.return_value = [np.array([0.1, 0.2, 0.3]) for _ in range(2)]
-        
-        # Call the function
+
+        # Mock tokenizer decode method
+        self.mock_tokenizer.decode.side_effect = lambda tokens: " ".join(map(str, tokens.tolist()))
+
         result = process_article_text(
             self.article_content,
             self.mock_tokenizer,
             max_pairs=2,
             compute_embeddings=True
         )
-        
-        # Verify results
+
         self.assertEqual(result["title"], "Wikipedia Article")
         self.assertEqual(len(result["pairs"]), 2)
         self.assertEqual(len(result["key_embeddings"]), 2)
-        # Verify each pair is a tuple of strings (decoded tokens)
+
         for pair in result["pairs"]:
             self.assertTrue(isinstance(pair[0], str))
             self.assertTrue(isinstance(pair[1], str))
+
         mock_batch_embeddings.assert_called_once()
     
     @patch('src.data.next_article')
