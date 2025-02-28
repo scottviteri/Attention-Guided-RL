@@ -1,26 +1,30 @@
 """
-Functions for computing and working with embeddings.
+Functions for computing embeddings of text.
 """
 
 import os
 import json
-import logging
 import time
+import hashlib
+import logging
 import numpy as np
 import torch
-from typing import Dict, List, Union, Optional, Any, Tuple
+import torch.nn.functional as F
+from typing import List, Dict, Any, Optional, Union, Tuple
+from dataclasses import dataclass
 from pathlib import Path
-from openai import OpenAI
 
-from src.config import OPENAI_API_KEY, EMBEDDING_MODEL
+from src.config import EMBEDDING_MODEL, MODEL_NAME
 from src.utils import ensure_dir
+from src.model import load_language_model
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# Global embedding service instances
-embedding_service = None
-llama_embedding_service = None
+# Default cache directory
+DEFAULT_CACHE_DIR = "embedding_cache"
+
+# Embedding service for llama model
 
 
 class LlamaEmbeddingService:
@@ -33,7 +37,7 @@ class LlamaEmbeddingService:
     def __init__(
         self, 
         model: 'LanguageModel',
-        cache_dir: str = "embedding_cache",
+        cache_dir: str = DEFAULT_CACHE_DIR,
         use_cache: bool = True,
         max_length: int = 512
     ):
@@ -419,120 +423,79 @@ class LlamaEmbeddingService:
             # Return zero vector as fallback
             return np.zeros(hidden_size)
     
-    def get_batch_embeddings(self, texts: List[str], are_queries: bool = True, normalize: bool = False) -> List[np.ndarray]:
+    def get_embeddings(self, texts: List[str], are_queries: bool = True, normalize: bool = False) -> List[np.ndarray]:
         """
-        Get embeddings for multiple texts in batch.
+        Get embeddings for multiple texts using Llama model activations.
         
         Args:
             texts: List of texts to embed
-            are_queries: Whether these texts should be treated as queries (True) or keys (False)
-            normalize: Whether to normalize the output vectors
+            are_queries: Whether the texts are queries (vs keys)
+            normalize: Whether to normalize the embeddings
             
         Returns:
             List of embeddings as numpy arrays
         """
-        if not texts:
-            return []
-            
-        # Convert are_queries to a list if it's a single boolean
-        if isinstance(are_queries, bool):
-            are_queries = [are_queries] * len(texts)
-        elif len(are_queries) != len(texts):
-            raise ValueError("Length of are_queries must match length of texts")
-        
-        # Check if all texts are of the same type (all queries or all keys)
-        all_queries = all(are_queries)
-        all_keys = all(not q for q in are_queries)
-        
         # Check cache first if enabled
-        embeddings = []
-        texts_to_compute = []
-        texts_indices = []
-        are_queries_to_compute = []
-        
         if self.use_cache:
-            # Try to get embeddings from cache first
-            for i, (text, is_query) in enumerate(zip(texts, are_queries)):
-                # Use different cache keys for queries and keys, and for normalized/unnormalized
-                cache_key = f"{'query' if is_query else 'key'}_{text}"
-                if normalize:
-                    cache_key = f"{'query' if is_query else 'key'}_norm_{text}"
-                    
-                cached_embedding = self._load_from_cache(cache_key)
-                
+            # Try to load all from cache
+            cached_embeddings = []
+            cache_misses = []
+            cache_miss_indices = []
+            
+            for i, text in enumerate(texts):
+                cached_embedding = self._load_from_cache(text)
                 if cached_embedding is not None:
-                    logger.debug(f"Cache HIT for {'query' if is_query else 'key'} embedding: {text[:50]}...")
-                    embeddings.append(cached_embedding)
+                    cached_embeddings.append((i, cached_embedding))
                 else:
-                    logger.debug(f"Cache MISS for {'query' if is_query else 'key'} embedding: {text[:50]}...")
-                    # Add to list of texts to compute
-                    texts_to_compute.append(text)
-                    texts_indices.append(i)
-                    are_queries_to_compute.append(is_query)
+                    cache_misses.append(text)
+                    cache_miss_indices.append(i)
+            
+            # If all were cached, return them
+            if len(cached_embeddings) == len(texts):
+                logger.debug(f"All {len(texts)} embeddings found in cache")
+                # Sort by original index
+                sorted_embeddings = sorted(cached_embeddings, key=lambda x: x[0])
+                return [emb for _, emb in sorted_embeddings]
         else:
-            # No cache, compute all
-            texts_to_compute = texts
-            texts_indices = list(range(len(texts)))
-            are_queries_to_compute = are_queries
-            embeddings = [None] * len(texts)  # Placeholder list
+            # If cache disabled, all are misses
+            cache_misses = texts
+            cache_miss_indices = list(range(len(texts)))
+            cached_embeddings = []
         
-        # If there are texts to compute
-        if texts_to_compute:
-            start_time = time.time()
-            computed_embeddings = []
+        # Compute embeddings for cache misses
+        computed_embeddings = []
+        if cache_misses:
+            logger.info(f"Computing {len(cache_misses)} embeddings (cache misses)")
             
-            # If all texts are queries, use batch query embeddings
-            if all(are_queries_to_compute):
-                logger.debug(f"Computing query embeddings for {len(texts_to_compute)} texts")
-                computed_embeddings = self._compute_attention_query_batch_embeddings(texts_to_compute, normalize=normalize)
-                
-                # Normalize if requested
-                if normalize:
-                    for i, emb in enumerate(computed_embeddings):
-                        norm = np.linalg.norm(emb)
-                        if norm > 0:
-                            computed_embeddings[i] = emb / norm
-                
-            # If all texts are keys, use batch standard embeddings for now (we'll implement batch key embeddings later)
-            elif all(not q for q in are_queries_to_compute):
-                logger.debug(f"Computing key embeddings for {len(texts_to_compute)} texts")
-                # We don't have a batch method for key embeddings yet, so compute them individually
-                computed_embeddings = []
-                for text in texts_to_compute:
-                    key_emb = self._compute_attention_key_embedding(text)
-                    computed_embeddings.append(key_emb)
-                
-            # If mixed, compute individually
+            if are_queries:
+                # Compute embeddings for queries - use attention mechanism
+                computed_embeddings = self._compute_attention_query_batch_embeddings(cache_misses, normalize)
             else:
-                logger.debug(f"Computing mixed embeddings for {len(texts_to_compute)} texts")
-                for text, is_query in zip(texts_to_compute, are_queries_to_compute):
-                    if is_query:
-                        emb = self._compute_attention_query_embedding(text, normalize=normalize)
-                    else:
-                        emb = self._compute_attention_key_embedding(text)
-                    computed_embeddings.append(emb)
+                # Regular embedding computation for keys
+                computed_embeddings = self._compute_llama_batch_embeddings(cache_misses)
             
-            logger.debug(f"Batch embeddings computed in {time.time() - start_time:.2f}s")
-            
-            # Cache computed embeddings and merge with cached ones
-            for i, (text, embedding, is_query) in enumerate(zip(texts_to_compute, computed_embeddings, are_queries_to_compute)):
-                if self.use_cache:
-                    # Use different cache keys for queries and keys, and for normalized/unnormalized
-                    cache_key = f"{'query' if is_query else 'key'}_{text}"
-                    if normalize:
-                        cache_key = f"{'query' if is_query else 'key'}_norm_{text}"
-                        
-                    self._save_to_cache(cache_key, embedding)
-                    logger.debug(f"Saved {'query' if is_query else 'key'} embedding to cache for text: {text[:50]}...")
-                
-                # If we had placeholders, fill them
-                if len(embeddings) > texts_indices[i]:
-                    embeddings[texts_indices[i]] = embedding
-                else:
-                    # Otherwise append
-                    embeddings.append(embedding)
+            # Cache the computed embeddings
+            if self.use_cache:
+                for text, embedding in zip(cache_misses, computed_embeddings):
+                    self._save_to_cache(text, embedding)
         
-        return embeddings
+        # Combine cached and computed embeddings
+        if cached_embeddings:
+            # Create result array with correct size
+            result = [None] * len(texts)
+            
+            # Fill in cached embeddings
+            for idx, emb in cached_embeddings:
+                result[idx] = emb
+            
+            # Fill in computed embeddings
+            for i, idx in enumerate(cache_miss_indices):
+                result[idx] = computed_embeddings[i]
+            
+            return result
+        else:
+            # All were computed
+            return computed_embeddings
     
     def _compute_llama_batch_embeddings(self, texts: List[str]) -> List[np.ndarray]:
         """
@@ -753,8 +716,6 @@ class LlamaEmbeddingService:
     
     def _get_cache_path(self, text: str) -> Path:
         """Get file path for cached embedding."""
-        import hashlib
-        
         # Create a hash of the text
         text_hash = hashlib.md5(text.encode()).hexdigest()
         
@@ -792,414 +753,41 @@ class LlamaEmbeddingService:
             logger.warning(f"Error saving to cache: {e}")
 
 
-class EmbeddingService:
+def compute_embeddings(
+    texts: List[str], 
+    are_queries: Union[bool, List[bool]] = True, 
+    normalize: bool = False,
+    model: Optional['LanguageModel'] = None
+) -> List[np.ndarray]:
     """
-    Service for computing and caching embeddings.
-    """
-    
-    def __init__(
-        self, 
-        model: str = EMBEDDING_MODEL,
-        cache_dir: str = "embedding_cache",
-        use_cache: bool = True
-    ):
-        """
-        Initialize the embedding service.
-        
-        Args:
-            model: Model to use for embeddings
-            cache_dir: Directory for caching embeddings
-            use_cache: Whether to use caching
-        """
-        self.model = model
-        self.cache_dir = cache_dir
-        self.use_cache = use_cache
-        
-        # Create cache directory if needed
-        if self.use_cache:
-            ensure_dir(self.cache_dir)
-        
-        # Initialize OpenAI client
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
-        
-        logger.info(f"Initialized EmbeddingService with model: {self.model}")
-    
-    def get_embedding(self, text: str) -> np.ndarray:
-        """
-        Get embedding for a text string.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Embedding as numpy array
-        """
-        # Check cache first if enabled
-        if self.use_cache:
-            cached_embedding = self._load_from_cache(text)
-            if cached_embedding is not None:
-                logger.debug(f"Cache HIT for text: {text[:50]}...")
-                return cached_embedding
-            else:
-                logger.debug(f"Cache MISS for text: {text[:50]}...")
-        
-        # Otherwise compute the embedding
-        try:
-            logger.info(f"Computing embedding for text: {text[:50]}...")
-            start_time = time.time()
-            
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=text
-            )
-            
-            embedding = np.array(response.data[0].embedding)
-            
-            elapsed = time.time() - start_time
-            logger.info(f"Embedding computed in {elapsed:.2f}s")
-            
-            # Cache the result if enabled
-            if self.use_cache:
-                self._save_to_cache(text, embedding)
-                logger.debug(f"Saved embedding to cache for text: {text[:50]}...")
-            
-            return embedding
-            
-        except Exception as e:
-            logger.error(f"Error computing embedding: {e}")
-            # Return zero vector as fallback
-            return np.zeros(1536)  # Default embedding size
-    
-    def get_batch_embeddings(self, texts: List[str]) -> List[np.ndarray]:
-        """
-        Get embeddings for multiple texts.
-        
-        Args:
-            texts: List of texts to embed
-            
-        Returns:
-            List of embeddings as numpy arrays
-        """
-        # Filter out texts that are already in cache
-        texts_to_compute = []
-        cached_embeddings = {}
-        
-        if self.use_cache:
-            for i, text in enumerate(texts):
-                cached = self._load_from_cache(text)
-                if cached is not None:
-                    cached_embeddings[i] = cached
-                else:
-                    texts_to_compute.append((i, text))
-        else:
-            texts_to_compute = [(i, text) for i, text in enumerate(texts)]
-        
-        # If all embeddings are cached, return them
-        if not texts_to_compute:
-            return [cached_embeddings[i] for i in range(len(texts))]
-        
-        # Otherwise compute the remaining embeddings
-        try:
-            logger.debug(f"Computing batch embeddings for {len(texts_to_compute)} texts")
-            start_time = time.time()
-            
-            # Extract just the texts for the API call
-            texts_for_api = [text for _, text in texts_to_compute]
-            
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=texts_for_api
-            )
-            
-            # Process and cache results
-            for idx, ((original_idx, text), data) in enumerate(zip(texts_to_compute, response.data)):
-                embedding = np.array(data.embedding)
-                
-                if self.use_cache:
-                    self._save_to_cache(text, embedding)
-                
-                cached_embeddings[original_idx] = embedding
-            
-            logger.debug(f"Batch embeddings computed in {time.time() - start_time:.2f}s")
-            
-            # Return embeddings in original order
-            return [cached_embeddings[i] for i in range(len(texts))]
-            
-        except Exception as e:
-            logger.error(f"Error computing batch embeddings: {e}")
-            # Return zero vectors as fallback
-            return [np.zeros(1536) for _ in range(len(texts))]
-    
-    def compute_similarity(
-        self, 
-        query_embedding: np.ndarray,
-        key_embeddings: Dict[str, np.ndarray]
-    ) -> Dict[str, float]:
-        """
-        Compute cosine similarity between query embedding and key embeddings.
-        
-        Args:
-            query_embedding: Query embedding
-            key_embeddings: Dictionary of key IDs to embeddings
-            
-        Returns:
-            Dictionary of key IDs to similarity scores
-        """
-        # Normalize query embedding
-        query_norm = np.linalg.norm(query_embedding)
-        if query_norm > 0:
-            query_embedding = query_embedding / query_norm
-        
-        # Compute cosine similarity for each key
-        similarities = {}
-        
-        for key_id, key_embedding in key_embeddings.items():
-            # Normalize key embedding
-            key_norm = np.linalg.norm(key_embedding)
-            if key_norm > 0:
-                key_embedding = key_embedding / key_norm
-            
-            # Compute dot product (cosine similarity for normalized vectors)
-            similarity = np.dot(query_embedding, key_embedding)
-            
-            # Ensure value is in valid range
-            similarity = max(0.0, min(1.0, float(similarity)))
-            
-            similarities[key_id] = similarity
-        
-        return similarities
-    
-    def _get_cache_path(self, text: str) -> Path:
-        """Get file path for cached embedding."""
-        import hashlib
-        
-        # Create a hash of the text
-        text_hash = hashlib.md5(text.encode()).hexdigest()
-        
-        # Create file path
-        return Path(self.cache_dir) / f"{text_hash}.json"
-    
-    def _load_from_cache(self, text: str) -> Optional[np.ndarray]:
-        """Load embedding from cache if available."""
-        cache_path = self._get_cache_path(text)
-        
-        if cache_path.exists():
-            try:
-                with open(cache_path, 'r') as f:
-                    data = json.load(f)
-                
-                return np.array(data["embedding"])
-            except Exception as e:
-                logger.warning(f"Error loading from cache: {e}")
-                return None
-        
-        return None
-    
-    def _save_to_cache(self, text: str, embedding: np.ndarray) -> None:
-        """Save embedding to cache."""
-        cache_path = self._get_cache_path(text)
-        
-        try:
-            with open(cache_path, 'w') as f:
-                json.dump({
-                    "text": text[:100] + "..." if len(text) > 100 else text,
-                    "embedding": embedding.tolist(),
-                    "timestamp": time.time()
-                }, f)
-        except Exception as e:
-            logger.warning(f"Error saving to cache: {e}")
-
-
-def initialize_llama_embedding_service(
-    model: 'LanguageModel',
-    cache_dir: str = "embedding_cache",
-    use_cache: bool = True
-) -> LlamaEmbeddingService:
-    """
-    Initialize the global Llama embedding service.
-    
-    Args:
-        model: The Llama language model
-        cache_dir: Directory for caching embeddings
-        use_cache: Whether to use caching
-        
-    Returns:
-        LlamaEmbeddingService instance
-    """
-    global llama_embedding_service
-    
-    if llama_embedding_service is None:
-        llama_embedding_service = LlamaEmbeddingService(
-            model=model,
-            cache_dir=cache_dir,
-            use_cache=use_cache
-        )
-    
-    return llama_embedding_service
-
-
-def get_llama_embedding_service() -> Optional[LlamaEmbeddingService]:
-    """
-    Get the global Llama embedding service instance.
-    
-    Returns:
-        LlamaEmbeddingService instance or None if not initialized
-    """
-    global llama_embedding_service
-    return llama_embedding_service
-
-
-def initialize_embedding_service(
-    model: str = EMBEDDING_MODEL,
-    cache_dir: str = "embedding_cache",
-    use_cache: bool = True
-) -> EmbeddingService:
-    """
-    Initialize the global embedding service.
-    
-    Args:
-        model: Model to use for embeddings
-        cache_dir: Directory for caching embeddings
-        use_cache: Whether to use caching
-        
-    Returns:
-        EmbeddingService instance
-    """
-    global embedding_service
-    
-    if embedding_service is None:
-        embedding_service = EmbeddingService(
-            model=model,
-            cache_dir=cache_dir,
-            use_cache=use_cache
-        )
-    
-    return embedding_service
-
-
-def get_embedding_service() -> EmbeddingService:
-    """
-    Get the global embedding service instance.
-    
-    Returns:
-        EmbeddingService instance
-    """
-    global embedding_service
-    
-    if embedding_service is None:
-        embedding_service = initialize_embedding_service()
-    
-    return embedding_service
-
-
-def compute_embedding(text: str, is_query: bool = True, normalize: bool = False) -> np.ndarray:
-    """
-    Compute an embedding for a text using available embedding services.
-    Tries Llama embeddings first, falls back to OpenAI if necessary.
-    
-    Args:
-        text: Text to embed
-        is_query: Whether this text is a query (True) or a key (False)
-        normalize: Whether to normalize the output vector
-        
-    Returns:
-        Embedding vector as numpy array
-    """
-    # Try to get the Llama embedding service first
-    llama_service = get_llama_embedding_service()
-    
-    if llama_service is not None:
-        try:
-            # Use specialized query or key embeddings based on is_query flag
-            if is_query:
-                return llama_service.get_query_embedding(text, normalize=normalize)
-            else:
-                return llama_service.get_key_embedding(text, normalize=normalize)
-        except Exception as e:
-            logger.warning(f"Failed to get Llama embedding: {e}. Falling back to OpenAI.")
-    
-    # Fall back to OpenAI embeddings
-    openai_service = get_embedding_service()
-    return openai_service.get_embedding(text)  # OpenAI embeddings are always normalized
-
-
-def batch_compute_embeddings(texts: List[str], are_queries: Union[bool, List[bool]] = True, normalize: bool = False) -> List[np.ndarray]:
-    """
-    Compute embeddings for multiple texts using available embedding services.
-    Tries Llama embeddings first, falls back to OpenAI if necessary.
+    Compute embeddings for a list of texts using the Llama model.
     
     Args:
         texts: List of texts to embed
-        are_queries: Whether these texts are queries (True) or keys (False).
-                     Can be a single boolean for all texts or a list of booleans for each text.
-        normalize: Whether to normalize the output vectors
+        are_queries: Whether the texts are queries (vs keys) or a list specifying for each text
+        normalize: Whether to normalize the embeddings
+        model: Optional pre-loaded language model to use
         
     Returns:
-        List of embedding vectors
+        List of embeddings as numpy arrays
     """
+    # Handle empty input
     if not texts:
         return []
     
-    # Convert are_queries to a list if it's a single boolean
-    if isinstance(are_queries, bool):
+    # Check if we have query flags for each text
+    if isinstance(are_queries, list):
+        if len(are_queries) != len(texts):
+            raise ValueError(f"Length of are_queries ({len(are_queries)}) must match length of texts ({len(texts)})")
+    else:
+        # Use the same flag for all texts
         are_queries = [are_queries] * len(texts)
-    elif len(are_queries) != len(texts):
-        raise ValueError("Length of are_queries must match length of texts")
     
-    # Try to get the Llama embedding service first
-    llama_service = get_llama_embedding_service()
+    # Create model and service just for this embedding operation
+    if model is None:
+        model = load_language_model()
     
-    if llama_service is not None:
-        try:
-            # Process texts in batches based on whether they are queries or keys
-            query_texts = []
-            query_indices = []
-            key_texts = []
-            key_indices = []
-            
-            # Separate texts into query and key groups
-            for i, (text, is_query) in enumerate(zip(texts, are_queries)):
-                if is_query:
-                    query_texts.append(text)
-                    query_indices.append(i)
-                else:
-                    key_texts.append(text)
-                    key_indices.append(i)
-                    
-            # Initialize results array
-            embeddings = [None] * len(texts)
-            
-            # Get all query embeddings if any
-            if query_texts:
-                if len(query_texts) > 1:
-                    # Use batch processing for multiple texts
-                    query_embeddings = llama_service.get_batch_embeddings(query_texts, are_queries=True, normalize=normalize)
-                else:
-                    # Use single processing for a single text
-                    query_embeddings = [llama_service.get_query_embedding(query_texts[0], normalize=normalize)]
-                
-                # Place query embeddings in the correct positions
-                for i, idx in enumerate(query_indices):
-                    embeddings[idx] = query_embeddings[i]
-            
-            # Get all key embeddings if any
-            if key_texts:
-                key_embeddings = []
-                for text in key_texts:
-                    key_embeddings.append(llama_service.get_key_embedding(text, normalize=normalize))
-                
-                # Place key embeddings in the correct positions
-                for i, idx in enumerate(key_indices):
-                    embeddings[idx] = key_embeddings[i]
-            
-            return embeddings
-        except Exception as e:
-            logger.warning(f"Failed to get Llama batch embeddings: {e}. Falling back to OpenAI.")
-    
-    # Fall back to OpenAI embeddings
-    openai_service = get_embedding_service()
-    return openai_service.get_batch_embeddings(texts)  # OpenAI embeddings are always normalized
-
-# For backward compatibility, keep the original function names as aliases
-ada_embedding = compute_embedding
-batch_ada_embeddings = batch_compute_embeddings 
+    service = LlamaEmbeddingService(model=model, use_cache=True)
+        
+    logger.debug(f"Using Llama model for {len(texts)} embeddings")
+    return service.get_embeddings(texts, are_queries=are_queries, normalize=normalize) 

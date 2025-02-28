@@ -9,7 +9,9 @@ from src.model import LanguageModel
 @pytest.fixture(scope="module")
 def language_model():
     """Fixture to provide a language model for tests."""
-    return LanguageModel(model_name="meta-llama/Llama-3.2-3B-Instruct", cache_dir="../model_cache")
+    return LanguageModel(model_name="meta-llama/Llama-3.2-3B-Instruct", 
+                          cache_dir="../model_cache", 
+                          device="cpu")
 
 def test_model_basic_structure(language_model):
     """Test the basic structure of the model."""

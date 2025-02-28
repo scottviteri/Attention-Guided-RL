@@ -10,30 +10,32 @@ import json
 import time
 from typing import Dict, List, Tuple, Any, Optional, Union
 from collections import deque
+import bitsandbytes as bnb
 
 from src.config import (
     KL_WEIGHT,
     BATCH_SIZE,
     QUERY_TOKEN_COUNT,
+    VALUE_TOKEN_COUNT,
     WARMUP_EPISODES,
     REWARD_SYSTEM_PROMPT
 )
-from src.embeddings import compute_embedding, batch_compute_embeddings
+from src.embeddings import compute_embeddings
 from src.utils import (
     softmax,
     sample_from_distribution,
-    compute_running_stats,
-    compute_kl_divergence
+    compute_running_stats
 )
 from src.model import LanguageModel
 from src.data import KeyValuePair
+from src.trajectory import Trajectory
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 class TrajectoryCollector:
     """
-    Class for collecting trajectories by sampling actions from the policy.
+    Class for collecting trajectories by rolling out the policy.
     """
     
     def __init__(
@@ -62,92 +64,192 @@ class TrajectoryCollector:
         
         logger.info(f"Initialized TrajectoryCollector with temperature: {temperature}")
     
-    def collect_trajectory(self, verbose: bool = False) -> List[Dict[str, Any]]:
+    def collect_trajectory(self, batch_size: int = 1, verbose: bool = False) -> Trajectory:
         """
-        Collect a single trajectory by rolling out the policy.
+        Collect trajectories by rolling out the policy.
         
         Args:
+            batch_size: Number of parallel trajectories to collect
             verbose: Whether to enable verbose logging
         
         Returns:
-            List of steps in the trajectory
+            Batched Trajectory object with steps
         """
-        # Reset the database
-        self.reset()
+        # Initialize batched trajectory
+        trajectory = Trajectory(batch_size=batch_size, device=self.model.device)
         
-        # Get the article title
-        article_title = self.title
+        # Initialize contexts for each batch element
+        contexts = [""] * batch_size
+        article_titles = [self.title] * batch_size
         
-        # Initialize empty context and trajectory
-        context = ""
-        trajectory = []
+        # Reset the database for each batch element
+        databases = [self.original_database.copy() for _ in range(batch_size)]
         
-        # Continue until all key-value pairs are selected
+        # Track if each trajectory is finished
+        active_trajectories = [True] * batch_size
+        
+        # Continue until all trajectories are complete
         step_count = 0
-        while not self.is_empty():
+        while any(active_trajectories):
             step_count += 1
             if verbose:
-                logger.debug(f"Trajectory step {step_count}: Generating query...")
+                logger.debug(f"Trajectory step {step_count}: Generating queries...")
             
-            # Generate query based on current context
-            query = self.model.generate_query(
-                context=context,
-                fixed_token_count=QUERY_TOKEN_COUNT,
-                temperature=self.temperature,
-                article_title=article_title
-            )
+            # Generate queries based on current contexts (only for active trajectories)
+            active_indices = [i for i, active in enumerate(active_trajectories) if active]
+            active_contexts = [contexts[i] for i in active_indices]
+            active_titles = [article_titles[i] for i in active_indices]
             
-            if verbose:
-                logger.debug(f"Generated query: {query}")
+            if not active_indices:
+                break
             
-            # Compute query embedding
-            # Explicitly specify this is a query embedding (is_query=True)
-            query_embedding = compute_embedding(query, is_query=True)
+            # Generate queries for active trajectories
+            active_queries = []
+            for i, context in enumerate(active_contexts):
+                query = self.model.generate_query(
+                    context=context,
+                    fixed_token_count=QUERY_TOKEN_COUNT,
+                    temperature=self.temperature,
+                    article_title=active_titles[i]
+                )
+                active_queries.append(query)
+                
+                if verbose:
+                    logger.debug(f"Batch {active_indices[i]}, Generated query: {query}")
             
-            if verbose:
-                logger.debug(f"Query embedding computed - shape: {query_embedding.shape}")
+            # Initialize step data with empty values
+            query_tokens_list = []
+            value_tokens_list = []
+            query_embeddings = []
+            key_ids = []
+            key_probs = []
+            raw_queries = [""] * batch_size
+            raw_values = [""] * batch_size
             
-            # Compute similarities with available keys
-            available_key_embeddings = self.get_available_key_embeddings()
-            similarities = {}
+            # Compute embeddings for active queries
+            active_query_embeddings = compute_embeddings(active_queries, are_queries=True)
             
-            for key_id, key_embedding in available_key_embeddings.items():
-                similarity = np.dot(query_embedding, key_embedding)
-                similarities[key_id] = float(similarity)
+            # For each active trajectory, compute similarities and select value
+            for batch_idx, global_idx in enumerate(active_indices):
+                query = active_queries[batch_idx]
+                query_embedding = active_query_embeddings[batch_idx]
+                
+                # Get available key embeddings for this batch element
+                available_key_embeddings = {}
+                for i, kv_pair in enumerate(databases[global_idx]):
+                    key_id = kv_pair.key_id if kv_pair.key_id else f"key_{i}"
+                    available_key_embeddings[key_id] = kv_pair.key_embedding
+                
+                # If no keys left, mark trajectory as complete
+                if not available_key_embeddings:
+                    active_trajectories[global_idx] = False
+                    continue
+                
+                # Compute similarities
+                similarities = {}
+                for key_id, key_embedding in available_key_embeddings.items():
+                    similarity = np.dot(query_embedding, key_embedding)
+                    similarities[key_id] = float(similarity)
+                
+                # Convert similarities to probabilities
+                similarity_values = np.array(list(similarities.values()))
+                probs = softmax(similarity_values, temperature=self.temperature)
+                
+                # Sample a key based on probabilities
+                selected_idx = sample_from_distribution(probs)
+                selected_key_id = list(similarities.keys())[selected_idx]
+                
+                if verbose:
+                    logger.debug(f"Batch {global_idx}, Selected key ID: {selected_key_id} (probability: {probs[selected_idx]:.4f})")
+                
+                # Get corresponding key-value pair
+                key, value = self._select_key(databases[global_idx], selected_key_id)
+                
+                if verbose:
+                    logger.debug(f"Batch {global_idx}, Retrieved value: {value[:50]}...")
+                
+                # Append to context for this batch element
+                if contexts[global_idx]:
+                    contexts[global_idx] += f" Query: {query} Value: {value} "
+                else:
+                    contexts[global_idx] = f"Query: {query} Value: {value} "
+                
+                # Tokenize query and value
+                query_tokens = self.model.tokenizer(
+                    query, 
+                    padding="max_length", 
+                    max_length=QUERY_TOKEN_COUNT,
+                    truncation=True,
+                    return_tensors="pt"
+                ).input_ids.squeeze(0)
+                
+                value_tokens = self.model.tokenizer(
+                    value, 
+                    padding="max_length", 
+                    max_length=VALUE_TOKEN_COUNT,
+                    truncation=True,
+                    return_tensors="pt"
+                ).input_ids.squeeze(0)
+                
+                # Add to batch lists
+                query_tokens_list.append(query_tokens.unsqueeze(0))
+                value_tokens_list.append(value_tokens.unsqueeze(0))
+                query_embeddings.append(query_embedding)
+                key_ids.append(selected_key_id)
+                
+                # Create key probabilities dictionary
+                key_probs_dict = {k: float(v) for k, v in zip(similarities.keys(), probs)}
+                key_probs.append(key_probs_dict)
+                
+                # Store raw strings
+                raw_queries[global_idx] = query
+                raw_values[global_idx] = value
+                
+                # Check if this batch element has completed its trajectory
+                if not databases[global_idx]:
+                    active_trajectories[global_idx] = False
             
-            # Convert similarities to probabilities
-            similarity_values = np.array(list(similarities.values()))
-            probs = softmax(similarity_values, temperature=self.temperature)
-            
-            # Sample a key based on probabilities
-            selected_idx = sample_from_distribution(probs)
-            selected_key_id = list(similarities.keys())[selected_idx]
-            
-            if verbose:
-                logger.debug(f"Selected key ID: {selected_key_id} (probability: {probs[selected_idx]:.4f})")
-            
-            # Get corresponding key-value pair
-            key, value = self.select_key(selected_key_id)
-            
-            if verbose:
-                logger.debug(f"Retrieved value: {value[:50]}...")
-            
-            # Append to context
-            if context:
-                context += f" Query: {query} Value: {value} "
-            else:
-                context = f"Query: {query} Value: {value} "
-            
-            # Record step in trajectory
-            trajectory.append({
-                "query": query,
-                "query_embedding": query_embedding,
-                "key_id": selected_key_id,
-                "key": key,
-                "value": value,
-                "similarities": similarities,
-                "probs": {k: float(v) for k, v in zip(similarities.keys(), probs)}
-            })
+            # If we have any active trajectories that selected values in this step
+            if query_tokens_list:
+                # Stack tensors for batch processing
+                query_tokens_batch = torch.cat(query_tokens_list, dim=0)
+                value_tokens_batch = torch.cat(value_tokens_list, dim=0)
+                query_embeddings_array = np.stack(query_embeddings)
+                
+                # For inactive trajectories, fill with zeros or empty values
+                for i in range(batch_size):
+                    if i not in active_indices or raw_queries[i] == "":
+                        # This batch element didn't get updated this step
+                        # Use zeros or empty values
+                        raw_queries[i] = "PADDING"
+                        raw_values[i] = "PADDING"
+                        if i not in active_indices:
+                            # This ensures we have the right shape for batching
+                            query_tokens_batch = torch.cat([
+                                query_tokens_batch, 
+                                torch.zeros(1, QUERY_TOKEN_COUNT, dtype=torch.long, device=self.model.device)
+                            ], dim=0)
+                            value_tokens_batch = torch.cat([
+                                value_tokens_batch, 
+                                torch.zeros(1, VALUE_TOKEN_COUNT, dtype=torch.long, device=self.model.device)
+                            ], dim=0)
+                            query_embeddings_array = np.concatenate([
+                                query_embeddings_array,
+                                np.zeros((1, query_embeddings_array.shape[1]))
+                            ], axis=0)
+                            key_ids.append("padding")
+                            key_probs.append({})
+                
+                # Add step to trajectory
+                trajectory.add_step(
+                    query_tokens=query_tokens_batch,
+                    value_tokens=value_tokens_batch,
+                    query_embeddings=query_embeddings_array,
+                    key_ids=key_ids,
+                    key_probs=key_probs,
+                    raw_queries=raw_queries,
+                    raw_values=raw_values
+                )
         
         return trajectory
 
@@ -155,23 +257,20 @@ class TrajectoryCollector:
         """Reset the database to its original state."""
         self.database = self.original_database.copy()
     
-    def is_empty(self) -> bool:
-        """Check if the database is empty."""
-        return len(self.database) == 0
-    
-    def get_available_key_embeddings(self) -> Dict[str, np.ndarray]:
-        """Get embeddings for available keys."""
-        embeddings = {}
-        for i, kv_pair in enumerate(self.database):
-            key_id = kv_pair.key_id if kv_pair.key_id else f"key_{i}"
-            embeddings[key_id] = kv_pair.key_embedding
-        return embeddings
-    
-    def select_key(self, key_id: str) -> Tuple[str, str]:
-        """Select a key-value pair and remove it from the database."""
+    def _select_key(self, database: List[KeyValuePair], key_id: str) -> Tuple[str, str]:
+        """
+        Select a key-value pair from a database and remove it.
+        
+        Args:
+            database: List of KeyValuePair objects
+            key_id: ID of the key to select
+            
+        Returns:
+            Tuple of (key, value) strings
+        """
         # Find the key-value pair with the given key_id
         selected_idx = -1
-        for i, kv_pair in enumerate(self.database):
+        for i, kv_pair in enumerate(database):
             current_key_id = kv_pair.key_id if kv_pair.key_id else f"key_{i}"
             if current_key_id == key_id:
                 selected_idx = i
@@ -181,7 +280,7 @@ class TrajectoryCollector:
             raise ValueError(f"Key ID {key_id} not found in database")
         
         # Get the key-value pair
-        kv_pair = self.database.pop(selected_idx)
+        kv_pair = database.pop(selected_idx)
         
         # Convert token IDs to text using the tokenizer if available
         if hasattr(self.model, 'tokenizer') and hasattr(kv_pair, 'key_tokens') and hasattr(kv_pair, 'value_tokens'):
@@ -193,29 +292,6 @@ class TrajectoryCollector:
             value = f"Value for {key_id}"
         
         return key, value
-    
-    def collect_batch_trajectories(self, batch_size: int = BATCH_SIZE, verbose: bool = False) -> List[List[Dict[str, Any]]]:
-        """
-        Collect multiple trajectories in parallel.
-        
-        Args:
-            batch_size: Number of trajectories to collect
-            verbose: Whether to enable verbose logging
-            
-        Returns:
-            List of trajectories
-        """
-        # For simplicity, collect trajectories sequentially
-        # In a more advanced implementation, this could be parallelized
-        trajectories = []
-        
-        for i in range(batch_size):
-            if verbose:
-                logger.debug(f"Collecting trajectory {i+1}/{batch_size}")
-            trajectory = self.collect_trajectory(verbose=verbose)
-            trajectories.append(trajectory)
-        
-        return trajectories
 
 class ReinforcementLearner:
     """
@@ -231,109 +307,131 @@ class ReinforcementLearner:
         kl_weight: float = KL_WEIGHT
     ):
         """
-        Initialize the reinforcement learner.
+        Initialize reinforcement learner.
         
         Args:
             model: Language model to train
-            baseline_model: Baseline model for reward normalization
-            optimizer: PyTorch optimizer or None to create a new one
+            baseline_model: Optional frozen model for baseline computation
+            optimizer: Optional optimizer (defaults to 8bit Adam)
             learning_rate: Learning rate for optimizer
-            kl_weight: Weight for KL divergence regularization
+            kl_weight: Weight for KL divergence penalty
         """
         self.model = model
         self.baseline_model = baseline_model
         self.kl_weight = kl_weight
         
-        # Create optimizer if not provided
+        # Initialize optimizer with 8bit Adam from bitsandbytes
         if optimizer is None:
-            self.optimizer = torch.optim.AdamW(
+            self.optimizer = bnb.optim.Adam8bit(
                 self.model.model.parameters(),
                 lr=learning_rate
             )
+            print("Using 8bit Adam optimizer")
         else:
             self.optimizer = optimizer
         
-        # Initialize reward statistics
+        # Store baseline rewards for warm-up phase
         self.baseline_rewards = []
         self.filtered_indices = []
         
         logger.info("Initialized ReinforcementLearner")
     
-    def compute_trajectory_reward(self, trajectory: List[Dict[str, Any]]) -> float:
+    def compute_trajectory_rewards(self, trajectory: Trajectory) -> List[float]:
         """
-        Compute reward for a single trajectory.
+        Compute rewards for a batch of trajectories.
+        If a baseline model is available, normalizes rewards by subtracting baseline rewards.
         
         Args:
-            trajectory: List of steps in the trajectory
+            trajectory: Batched trajectory
             
         Returns:
-            Reward value
+            List of rewards, one per batch element
         """
-        return self.model.calculate_trajectory_reward(
-            trajectory=trajectory,
-            system_prompt=REWARD_SYSTEM_PROMPT,
-            baseline_model=self.baseline_model
-        )
-
-    def compute_batch_trajectory_rewards(self, trajectories: List[List[Dict[str, Any]]]) -> List[float]:
-        """
-        Compute rewards for multiple trajectories in a batched manner for efficiency.
+        # Get reward contexts
+        contexts = trajectory.get_reward_contexts(system_prompt="Evaluate the log probability")
         
-        Args:
-            trajectories: List of trajectories, where each trajectory is a list of steps
+        # Compute rewards using current model
+        rewards = self.model.calculate_trajectory_rewards(contexts, baseline_model=None)
+        
+        # If baseline model exists, compute baseline rewards and normalize
+        if self.baseline_model is not None:
+            # Compute baseline rewards using frozen model
+            baseline_rewards = self.baseline_model.calculate_trajectory_rewards(contexts, baseline_model=None)
             
-        Returns:
-            List of reward values
-        """
-        return self.model.calculate_batch_trajectory_rewards(
-            trajectories=trajectories,
-            system_prompt=REWARD_SYSTEM_PROMPT,
-            baseline_model=self.baseline_model
-        )
+            # Normalize by subtracting baseline
+            normalized_rewards = [r - b for r, b in zip(rewards, baseline_rewards)]
+            return normalized_rewards
+        
+        # Return unnormalized rewards if no baseline model
+        return rewards
     
     def compute_policy_loss(
         self, 
-        trajectory: List[Dict[str, Any]], 
-        reward: float, 
+        trajectory: Trajectory, 
+        rewards: Union[float, List[float]], 
         baseline: float = 0.0
     ) -> torch.Tensor:
         """
         Compute policy gradient loss for a trajectory.
         
         Args:
-            trajectory: List of steps in the trajectory
-            reward: Reward for the trajectory
+            trajectory: Trajectory object with steps
+            rewards: Reward for the trajectory or list of rewards for batch
             baseline: Baseline reward for advantage
             
         Returns:
             Loss tensor
         """
-        # Compute advantage
-        advantage = reward - baseline
+        # Handle batched vs. single reward
+        if isinstance(rewards, (int, float)):
+            batch_rewards = [rewards]
+        else:
+            batch_rewards = rewards
+            
+        # Make sure we have a reward for each batch element
+        if len(batch_rewards) != trajectory.get_batch_size():
+            raise ValueError(f"Mismatch between rewards length ({len(batch_rewards)}) and batch size ({trajectory.get_batch_size()})")
+        
+        # Compute advantage for each batch element
+        advantages = [reward - baseline for reward in batch_rewards]
         
         # Initialize loss
         loss = torch.tensor(0.0, device=self.model.device, requires_grad=True)
         
         # For each step in the trajectory
-        for step in trajectory:
-            # Get the probability of the selected action
-            selected_key_id = step["key_id"]
-            action_probs = step["probs"]
-            action_prob = action_probs[selected_key_id]
-            
-            # Policy gradient loss: -log(π(a|s)) * advantage
-            step_loss = -torch.log(torch.tensor(action_prob, device=self.model.device)) * advantage
-            loss = loss + step_loss
+        for step in range(len(trajectory)):
+            for b in range(trajectory.get_batch_size()):
+                # Get the key probabilities for this batch element at this step
+                key_probs_dict = trajectory.key_probs[step][b]
+                
+                # Skip if this is a padding step
+                if not key_probs_dict:
+                    continue
+                
+                # Get the selected key ID
+                selected_key_id = trajectory.key_ids[step][b]
+                
+                # Skip if this is a padding step
+                if selected_key_id == "padding":
+                    continue
+                
+                # Get the probability of the selected action
+                action_prob = key_probs_dict[selected_key_id]
+                
+                # Policy gradient loss: -log(π(a|s)) * advantage
+                step_loss = -torch.log(torch.tensor(action_prob, device=self.model.device)) * advantages[b]
+                loss = loss + step_loss
         
-        # Average over trajectory length
-        loss = loss / len(trajectory)
+        # Average over trajectory length and batch size
+        loss = loss / (len(trajectory) * trajectory.get_batch_size())
         
         return loss
     
     def compute_kl_loss(
         self, 
         old_outputs: torch.Tensor, 
-        new_outputs: torch.Tensor
+        new_outputs: torch.Tensor,
+        value_positions: List[Tuple[int, int]]
     ) -> torch.Tensor:
         """
         Compute KL divergence loss between old and new model outputs.
@@ -341,29 +439,55 @@ class ReinforcementLearner:
         Args:
             old_outputs: Logits from the old model
             new_outputs: Logits from the new model
+            value_positions: List of (start, end) positions for values.
+                             All batch elements are expected to have the same positions.
             
         Returns:
             KL divergence loss
         """
-        # Compute softmax probabilities
-        old_probs = torch.softmax(old_outputs, dim=-1)
-        new_probs = torch.softmax(new_outputs, dim=-1)
+        # Create a mask for the positions we want to include
+        mask = torch.zeros_like(old_outputs[:, :, 0], dtype=torch.bool)
         
-        # Compute KL divergence
-        kl_div = compute_kl_divergence(old_probs, new_probs)
+        # Fill in the mask for value positions
+        for start, end in value_positions:
+            # Skip the tag tokens, only include content tokens
+            for pos in range(start, end):
+                if pos < old_outputs.size(1):
+                    mask[:, pos] = True
+        
+        # Apply the mask to keep only value tokens for KL calculation
+        # We need to expand mask to match the shape of old_outputs and new_outputs
+        expanded_mask = mask.unsqueeze(-1).expand_as(old_outputs)
+        
+        # Use the mask to select only relevant positions
+        masked_old_outputs = old_outputs[expanded_mask].view(-1, old_outputs.size(-1))
+        masked_new_outputs = new_outputs[expanded_mask].view(-1, new_outputs.size(-1))
+        
+        # Compute softmax probabilities for the masked outputs
+        old_probs = torch.softmax(masked_old_outputs, dim=-1)
+        log_new_probs = torch.log_softmax(masked_new_outputs, dim=-1)
+        
+        # Compute KL divergence directly using F.kl_div for numerical stability
+        # Note: F.kl_div expects log probabilities as first argument
+        kl_div = torch.nn.functional.kl_div(
+            log_new_probs, 
+            old_probs, 
+            reduction='batchmean', 
+            log_target=False
+        )
         
         return kl_div
     
     def update_policy(
         self, 
-        trajectories: List[List[Dict[str, Any]]], 
+        trajectory: Trajectory, 
         rewards: List[float]
     ) -> Dict[str, float]:
         """
         Update policy using batch of trajectories.
         
         Args:
-            trajectories: List of trajectories
+            trajectory: Batched Trajectory containing multiple trajectories
             rewards: Rewards for each trajectory
             
         Returns:
@@ -374,107 +498,152 @@ class ReinforcementLearner:
         
         # Compute mean and std of rewards
         if len(self.baseline_rewards) <= WARMUP_EPISODES:
-            # During warm-up, don't update the policy
-            logger.info(f"Warm-up phase: {len(self.baseline_rewards)}/{WARMUP_EPISODES}")
+            # Still in warm-up phase, don't update policy
+            logger.info(f"Warmup phase: {len(self.baseline_rewards)}/{WARMUP_EPISODES} episodes")
             return {
-                "loss": 0.0,
-                "reward_mean": np.mean(rewards),
+                "loss": 0.0, 
+                "kl_loss": 0.0, 
+                "policy_loss": 0.0,
+                "grad_norm": 0.0,
+                "reward_mean": np.mean(rewards), 
                 "reward_std": np.std(rewards),
-                "filtered_count": 0
+                "filtered_ratio": 0.0
             }
         
-        # Compute running statistics
-        running_mean, running_std = compute_running_stats(self.baseline_rewards)
+        # Compute filter threshold using running stats
+        mean, std = compute_running_stats(self.baseline_rewards)
+        threshold = mean + std
         
-        # Filter trajectories based on reward threshold
-        reward_threshold = running_mean + running_std
-        filtered_trajectories = []
-        filtered_rewards = []
-        
-        for i, (trajectory, reward) in enumerate(zip(trajectories, rewards)):
-            if reward > reward_threshold:
-                filtered_trajectories.append(trajectory)
-                filtered_rewards.append(reward)
-                self.filtered_indices.append(len(self.baseline_rewards) - len(rewards) + i)
-        
-        # If no trajectories pass the filter, skip the update
-        if not filtered_trajectories:
-            logger.info("No trajectories passed the filter, skipping update")
+        # Filter trajectories that exceed the threshold
+        filtered_indices = [i for i, r in enumerate(rewards) if r > threshold]
+        if not filtered_indices:
+            logger.info(f"No trajectories passed the filter (threshold: {threshold:.4f})")
             return {
-                "loss": 0.0,
-                "reward_mean": running_mean,
-                "reward_std": running_std,
-                "filtered_count": 0
+                "loss": 0.0, 
+                "kl_loss": 0.0, 
+                "policy_loss": 0.0,
+                "grad_norm": 0.0,
+                "reward_mean": mean, 
+                "reward_std": std,
+                "filtered_ratio": 0.0
             }
         
-        # Compute baseline for advantage
-        baseline = running_mean
+        logger.info(f"{len(filtered_indices)}/{len(rewards)} trajectories passed the filter")
         
-        # Accumulate gradient for each filtered trajectory
-        total_loss = 0.0
+        # Get reward contexts for filtered trajectories
+        filtered_contexts = [trajectory.get_reward_contexts()[i] for i in filtered_indices]
+        filtered_rewards = [rewards[i] for i in filtered_indices]
         
+        # Zero gradients
         self.optimizer.zero_grad()
         
-        for trajectory, reward in zip(filtered_trajectories, filtered_rewards):
-            # Compute policy loss
-            policy_loss = self.compute_policy_loss(trajectory, reward, baseline)
-            
-            # Add regularization (KL divergence could be computed here)
-            # For simplicity, we'll skip actual KL computation in this example
-            total_loss += policy_loss
+        # Tokenize filtered contexts
+        inputs = self.model.tokenizer(
+            filtered_contexts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True
+        ).to(self.model.device)
+        input_ids = inputs.input_ids
+        attention_mask = inputs.attention_mask
         
-        # Average loss over filtered trajectories
-        avg_loss = total_loss / len(filtered_trajectories)
+        # Extract value positions using only the first batch element
+        # since all batch elements should have the same structure
+        value_positions = self.model._extract_value_positions(input_ids[:1])
         
-        # Backpropagate and update
-        avg_loss.backward()
+        # Forward pass with old model
+        with torch.no_grad():
+            old_outputs = self.model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            old_logits = old_outputs.logits.detach()
         
-        # Get gradient norm for logging
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.model.parameters(), max_norm=1.0)
+        # Forward pass with updated model
+        outputs = self.model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        logits = outputs.logits
         
+        # Compute policy loss
+        policy_loss = self.compute_policy_loss(
+            trajectory=trajectory,
+            rewards=filtered_rewards,
+            baseline=mean
+        )
+        
+        # Compute KL divergence loss
+        kl_loss = self.compute_kl_loss(
+            old_outputs=old_logits,
+            new_outputs=logits,
+            value_positions=value_positions
+        )
+        
+        # Total loss
+        total_loss = policy_loss + self.kl_weight * kl_loss
+        
+        # Backward pass and optimization
+        total_loss.backward()
+        
+        # Clip gradients
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.model.parameters(),
+            max_norm=1.0
+        )
+        
+        # Update model parameters
         self.optimizer.step()
         
-        # Return metrics
         return {
-            "loss": avg_loss.item(),
+            "loss": total_loss.item(),
+            "policy_loss": policy_loss.item(),
+            "kl_loss": kl_loss.item(),
             "grad_norm": grad_norm.item(),
-            "reward_mean": running_mean,
-            "reward_std": running_std,
-            "filtered_count": len(filtered_trajectories)
+            "reward_mean": mean,
+            "reward_std": std,
+            "filtered_ratio": len(filtered_indices) / len(rewards)
         }
 
 def train_episode(
     collector: TrajectoryCollector,
     learner: ReinforcementLearner,
     batch_size: int = BATCH_SIZE,
+    baseline_shift: float = 0.0,
     verbose: bool = False
-) -> Dict[str, Any]:
+) -> Dict[str, float]:
     """
-    Run a single training episode.
+    Train for a single episode.
     
     Args:
-        collector: Trajectory collector
-        learner: Reinforcement learner
-        batch_size: Number of trajectories to collect per batch
+        collector: TrajectoryCollector to collect trajectories
+        learner: ReinforcementLearner to update policy
+        batch_size: Number of trajectories per batch
+        baseline_shift: Additional shift for the baseline (can help with exploration)
         verbose: Whether to enable verbose logging
         
     Returns:
-        Dictionary with episode metrics
+        Dictionary of training metrics
     """
-    # Collect trajectories
-    trajectories = collector.collect_batch_trajectories(batch_size, verbose)
+    # Collect batched trajectory
+    trajectory = collector.collect_trajectory(batch_size=batch_size, verbose=verbose)
     
-    # Compute rewards for all trajectories in batched manner
-    rewards = learner.compute_batch_trajectory_rewards(trajectories)
+    # Compute rewards
+    rewards = learner.compute_trajectory_rewards(trajectory)
     
     # Update policy
-    metrics = learner.update_policy(trajectories, rewards)
+    update_stats = learner.update_policy(trajectory, rewards)
     
-    return {
-        "trajectories": trajectories,
-        "rewards": rewards,
-        "metrics": metrics
+    # Combine stats
+    stats = {
+        'reward_mean': np.mean(rewards),
+        'reward_std': np.std(rewards),
+        'reward_min': np.min(rewards),
+        'reward_max': np.max(rewards),
+        **update_stats
     }
+    
+    return stats
 
 def run_training(
     model: 'LanguageModel',
@@ -502,8 +671,12 @@ def run_training(
     Returns:
         List of rewards for each episode
     """
-    # Initialize baseline model
-    baseline_model = None  # Or implement a baseline model
+    # Initialize baseline model - use a fresh instance of the same pretrained model
+    baseline_model = LanguageModel(
+        model_name=model.model_name,
+        device=model.device
+    )
+    logger.info("Initialized baseline model for reward normalization")
     
     # Initialize trajectory collector
     collector = TrajectoryCollector(model, database)
@@ -518,42 +691,76 @@ def run_training(
     
     # Track rewards
     episode_rewards = []
+    running_reward_stats = {"mean": 0.0, "std": 1.0}
+    
+    # Track best model
+    best_reward = float("-inf")
     
     # Training loop
-    for episode in range(num_episodes):
-        if verbose:
-            logger.debug(f"Starting episode {episode+1}/{num_episodes}")
-        else:
-            logger.info(f"Episode {episode+1}/{num_episodes}")
+    for episode in range(1, num_episodes + 1):
+        start_time = time.time()
         
-        # Train one episode
-        result = train_episode(collector, learner, batch_size, verbose)
+        # Warm-up period: no policy updates
+        if episode <= WARMUP_EPISODES:
+            logger.info(f"Episode {episode}/{num_episodes} (warm-up)")
+            # Collect trajectories but don't update policy
+            trajectory = collector.collect_trajectory(batch_size=batch_size, verbose=verbose)
+            rewards = learner.compute_trajectory_rewards(trajectory)
+            episode_reward = np.mean(rewards)
+            duration = time.time() - start_time
+            
+            logger.info(f"Episode {episode}: Reward = {episode_reward:.4f}, Duration = {duration:.2f}s")
+            
+            # Update reward stats
+            if episode == 1:
+                running_reward_stats["mean"] = episode_reward
+                running_reward_stats["std"] = 1.0
+            else:
+                running_reward_stats = compute_running_stats(
+                    rewards=episode_rewards + [episode_reward], 
+                    window_size=max(1, min(len(episode_rewards), 5))
+                )
+            
+            episode_rewards.append(episode_reward)
+            continue
+        
+        # Regular episodes
+        logger.info(f"Episode {episode}/{num_episodes}")
+        
+        # Train for one episode
+        stats = train_episode(
+            collector=collector,
+            learner=learner,
+            batch_size=batch_size,
+            verbose=verbose
+        )
+        
+        # Extract reward
+        episode_reward = stats["reward_mean"]
+        episode_rewards.append(episode_reward)
+        
+        # Update running stats for standardization
+        running_reward_stats = compute_running_stats(
+            rewards=episode_rewards, 
+            window_size=max(1, min(len(episode_rewards), 5))
+        )
+        
+        # Calculate duration
+        duration = time.time() - start_time
         
         # Log metrics
-        logger.info(f"  Loss: {result['loss']:.4f}")
-        logger.info(f"  Mean reward: {result['reward_mean']:.4f}")
-        logger.info(f"  Filtered trajectories: {result['filtered_count']}/{batch_size}")
+        logger.info(
+            f"Episode {episode}: Reward = {episode_reward:.4f}, "
+            f"Loss = {stats.get('loss', 0):.4f}, "
+            f"Duration = {duration:.2f}s"
+        )
         
-        if verbose:
-            logger.debug(f"  Detailed metrics:")
-            logger.debug(f"    Reward std: {result.get('reward_std', 0):.4f}")
-            logger.debug(f"    Gradient norm: {result.get('grad_norm', 0):.4f}")
-            logger.debug(f"    Individual rewards: {result['rewards']}")
-        
-        # Track rewards for this episode
-        episode_rewards.append(result['reward_mean'])
-        
-        # Log to wandb if available
-        try:
-            import wandb
-            if wandb.run is not None:
-                wandb.log({
-                    "loss": result["loss"],
-                    "reward_mean": result["reward_mean"],
-                    "filtered_count": result["filtered_count"],
-                    "grad_norm": result.get("grad_norm", 0)
-                }, step=episode)
-        except ImportError:
-            pass
+        # Track best model
+        if episode_reward > best_reward and not disable_checkpoints:
+            best_reward = episode_reward
+            # Save checkpoint
+            model_path = f"checkpoints/episode_{episode}_reward_{episode_reward:.4f}"
+            model.save_checkpoint(model_path)
+            logger.info(f"New best model saved to {model_path}")
     
     return episode_rewards 

@@ -1,10 +1,10 @@
 torch>=2.0.0
 transformers>=4.30.0
-openai>=1.0.0
 numpy>=1.24.0
 pytest>=7.3.1
 tqdm>=4.65.0
 wandb>=0.15.0
 matplotlib>=3.7.0
 sentence-transformers>=2.2.2  # Alternative for embeddings if needed
-datasets>=2.14.0  # For Huggingface datasets and Wikipedia articles 
+datasets>=2.14.0  # For Huggingface datasets and Wikipedia articles
+bitsandbytes>=0.43.0  # For 8-bit Adam optimizer 

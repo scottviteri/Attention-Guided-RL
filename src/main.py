@@ -19,11 +19,8 @@ import wandb
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
 from src.config import (
-    WIKI_ARTICLE_TITLE,
+    MODEL_NAME,
     MAX_PAIRS,
     KL_WEIGHT,
     NUM_EPISODES,
@@ -32,9 +29,8 @@ from src.config import (
 )
 from src.data import load_wikipedia_article, load_random_wikipedia_article
 from src.model import load_language_model
-from src.embeddings import EmbeddingService, initialize_llama_embedding_service, initialize_embedding_service
-from src.rl_agent import ReinforcementLearner, run_training
-from src.utils import ensure_dir
+from src.utils import ensure_dir, plot_rewards
+from src.rl_agent import run_training
 
 # Set up logging
 logging.basicConfig(
@@ -49,7 +45,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train a reinforcement learning agent on Wikipedia articles")
     
     # Data arguments
-    parser.add_argument("--title", type=str, default=WIKI_ARTICLE_TITLE,
+    parser.add_argument("--title", type=str, default=MODEL_NAME,
                         help="Title of the Wikipedia article to use")
     parser.add_argument("--random-article", action="store_true",
                         help="Use a random Wikipedia article instead of a specific title")
@@ -110,26 +106,6 @@ def setup_logging(args, disable_wandb: bool = False) -> Optional[Dict[str, Any]]
     return config
 
 
-def plot_rewards(episode_rewards: List[float], output_dir: str):
-    """Plot rewards over episodes."""
-    plt.figure(figsize=(10, 6))
-    plt.plot(episode_rewards)
-    plt.title("Rewards over Episodes")
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
-    plt.grid(True)
-    
-    # Save plot
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(output_dir, f"rewards_{timestamp}.png")
-    plt.savefig(output_path)
-    logger.info(f"Saved rewards plot to {output_path}")
-    
-    # Log to wandb if available
-    if wandb.run is not None:
-        wandb.log({"rewards_plot": plt})
-
-
 def main():
     """Main function."""
     # Parse arguments
@@ -150,22 +126,6 @@ def main():
     # Load the language model
     logger.info("Loading language model")
     model = load_language_model()
-    
-    # Initialize the embedding services
-    # First initialize the Llama-based embedding service
-    logger.info("Initializing Llama embedding service")
-    llama_embedding_service = initialize_llama_embedding_service(
-        model=model,
-        use_cache=not args.no_cache
-    )
-    logger.info(f"Llama embedding service initialized with cache {'disabled' if args.no_cache else 'enabled'}")
-    
-    # Also initialize OpenAI embedding service as fallback
-    if args.verbose:
-        logger.debug("Initializing OpenAI embedding service as fallback")
-    openai_embedding_service = initialize_embedding_service(
-        use_cache=not args.no_cache
-    )
     
     # Load the Wikipedia article
     logger.info("Loading Wikipedia article")

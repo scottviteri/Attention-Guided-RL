@@ -104,7 +104,7 @@ venv.bak/
 
 # Project specific
 data_cache/
-embeddings_cache/
+embedding_cache/
 model_cache/
 checkpoints/
 logs/

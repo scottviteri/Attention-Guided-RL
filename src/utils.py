@@ -147,29 +147,6 @@ def plot_rewards(rewards: List[float], filtered_indices: List[int], save_path: s
     plt.savefig(save_path)
     logger.info(f"Reward plot saved to {save_path}")
 
-def compute_kl_divergence(old_probs: torch.Tensor, new_probs: torch.Tensor) -> torch.Tensor:
-    """
-    Compute KL divergence between two probability distributions.
-    
-    Args:
-        old_probs: Old probability distribution (shape: batch_size x seq_len x vocab_size)
-        new_probs: New probability distribution (shape: batch_size x seq_len x vocab_size)
-        
-    Returns:
-        KL divergence value
-    """
-    # Add small epsilon for numerical stability
-    eps = 1e-8
-    old_probs = torch.clamp(old_probs, min=eps)
-    
-    # Apply log_softmax to new_probs directly for numerical stability
-    # instead of computing softmax first and then taking the log
-    log_new_probs = F.log_softmax(new_probs, dim=-1)
-    
-    # Use KL divergence formula with log_probs and probs directly
-    kl_div = F.kl_div(log_new_probs, old_probs, reduction='batchmean')
-    return kl_div
-
 def format_query_prompt(context: str, instructions: str, article_title: str = None) -> str:
     """
     Format the prompt for query generation using INSTRUCT format.
@@ -189,58 +166,19 @@ def format_query_prompt(context: str, instructions: str, article_title: str = No
     if article_title:
         article_prefix = f"Article: {article_title}\n\n"
     
-    return f"{USER_START} {article_prefix}{context} {instructions} {EOT_TOKEN} {ASSISTANT_START} "
+    return f"{USER_START} {article_prefix}{context} {instructions} {EOT_TOKEN} {ASSISTANT_START} <query> "
 
 def format_reward_context(system_prompt: str, query_key_pairs: str) -> str:
     """
-    Format the context for reward calculation using INSTRUCT format.
+    Format system prompt and query-key pairs into a reward model context.
     
     Args:
-        system_prompt: Descriptive system prompt
-        query_key_pairs: All query-key pairs in the trajectory
+        system_prompt: System prompt
+        query_key_pairs: String containing query-key pairs
         
     Returns:
-        Formatted context string with correct INSTRUCT markers
+        Formatted context
     """
     from src.config import SYSTEM_START, USER_START, EOT_TOKEN
     
-    return f"{SYSTEM_START} {system_prompt} {EOT_TOKEN} {USER_START} {query_key_pairs} {EOT_TOKEN}"
-
-def extract_value_positions(input_ids: torch.Tensor, tokenizer, value_marker: str = "Value:") -> List[Tuple[int, int]]:
-    """
-    Extract positions of values in the tokenized input.
-    
-    Args:
-        input_ids: Tokenized input
-        tokenizer: Tokenizer for the model
-        value_marker: Marker for value content
-        
-    Returns:
-        List of (start, end) positions for values
-    """
-    # Convert input_ids to string
-    text = tokenizer.decode(input_ids[0])
-    
-    # Find all occurrences of the value marker
-    value_positions = []
-    marker_token_ids = tokenizer.encode(value_marker, add_special_tokens=False)
-    marker_len = len(marker_token_ids)
-    
-    for i in range(len(input_ids[0]) - marker_len + 1):
-        if input_ids[0][i:i+marker_len].tolist() == marker_token_ids:
-            # Find the end of this value (next EOT_TOKEN or end of sequence)
-            eot_token_ids = tokenizer.encode(EOT_TOKEN, add_special_tokens=False)
-            eot_len = len(eot_token_ids)
-            
-            end_pos = None
-            for j in range(i + marker_len, len(input_ids[0]) - eot_len + 1):
-                if input_ids[0][j:j+eot_len].tolist() == eot_token_ids:
-                    end_pos = j
-                    break
-            
-            if end_pos is None:
-                end_pos = len(input_ids[0])
-                
-            value_positions.append((i + marker_len, end_pos))
-    
-    return value_positions 
+    return f"{SYSTEM_START} {system_prompt} {EOT_TOKEN} {USER_START} {query_key_pairs} {EOT_TOKEN}" 
