@@ -10,6 +10,7 @@ from datasets import load_dataset
 import torch
 from dataclasses import dataclass, field
 import random
+import itertools
 
 from src.config import (
     WIKI_ARTICLE_TITLE, 
@@ -266,474 +267,245 @@ def process_article(
     article_text: str,
     tokenizer,
     model,
-    chunk_size: int,
-    min_chunks_per_article: int = 10
+    chunk_size: int = KEY_TOKEN_COUNT,
+    max_pairs: int = MAX_PAIRS,
+    non_overlapping: bool = True,
+    random_selection: bool = True
 ) -> List[KeyValuePair]:
     """
-    Process a single article, creating non-overlapping key-value pairs.
+    Process a single article into key-value pairs with embeddings.
     
     Args:
         title: Article title
         article_text: Text content of the article
         tokenizer: Tokenizer to use for processing
-        model: Language model for computing embeddings (required)
+        model: Language model for computing embeddings
         chunk_size: Size of each chunk in tokens
-        min_chunks_per_article: Minimum number of chunks required for the article
+        max_pairs: Maximum number of pairs to create
+        non_overlapping: If True, create non-overlapping pairs
+        random_selection: If True, randomly select which pairs to use
         
     Returns:
-        List of KeyValuePair objects or empty list if article is too short
+        List of KeyValuePair objects
     """
+    # Get chunks
     try:
-        # Tokenize article into chunks
         chunks = tokenize_article_into_chunks(
             article_text,
             tokenizer,
             chunk_size=chunk_size,
-            max_chunks=min_chunks_per_article * 2,  # Need at least twice the min for non-overlapping pairs
-            skip_if_too_short=True
+            max_chunks=max_pairs * 2 if non_overlapping else max_pairs + 1
         )
         
-        # Create WikiArticle object (now with batched structure)
-        wiki_article = WikiArticle(titles=[title], chunks_list=[chunks], texts=[article_text])
-        
-        # Create non-overlapping key-value pairs
-        pairs = []
-        key_texts = []
-        
-        for i in range(0, len(wiki_article.chunks_list[0]) - 1, 2):
-            if i+1 < len(wiki_article.chunks_list[0]):
-                # Store token chunks
-                pairs.append((i, wiki_article.chunks_list[0][i], wiki_article.chunks_list[0][i+1]))
-                
-                # Add key text for batch embedding - convert tensor to list for tokenizer
-                key_text = tokenizer.decode(wiki_article.chunks_list[0][i].tolist())
-                key_texts.append(key_text)
-        
-        # Check if we have enough pairs
-        if len(pairs) < min_chunks_per_article // 2:
-            logger.warning(f"Article '{title}' has too few pairs ({len(pairs)}), skipping")
+        # If we don't have enough chunks, return empty list
+        if (non_overlapping and len(chunks) < 2) or len(chunks) < 1:
+            logger.warning(f"Article '{title}' has insufficient chunks ({len(chunks)})")
             return []
-            
+        
+        # Create pairs
+        chunk_pairs = create_key_value_pairs_from_chunks(
+            chunks=chunks,
+            max_pairs=max_pairs,
+            non_overlapping=non_overlapping,
+            random_selection=random_selection
+        )
+        
+        if not chunk_pairs:
+            logger.warning(f"No pairs could be created from article '{title}'")
+            return []
+        
+        # Extract key texts for batch embedding
+        key_texts = []
+        for key_tokens, _ in chunk_pairs:
+            key_text = tokenizer.decode(key_tokens)
+            key_texts.append(key_text)
+        
         # Get embeddings for all keys at once
         key_embeddings = compute_embeddings(key_texts, model=model, are_queries=False)
         
         # Create KeyValuePair objects
         result_pairs = []
-        for idx, (pair_idx, key_tokens, value_tokens) in enumerate(pairs):
-            key_id = f"key_{idx}"
+        for idx, ((key_tokens, value_tokens), embedding) in enumerate(zip(chunk_pairs, key_embeddings)):
+            key_text = key_texts[idx]
+            value_text = tokenizer.decode(value_tokens)
             
-            # Create KeyValuePair
             pair = KeyValuePair(
-                key_id=key_id,
+                key_id=f"key_{idx}",
                 key_tokens=key_tokens,
                 value_tokens=value_tokens,
-                key_embedding=key_embeddings[idx],
-                key=key_texts[idx],
-                value=tokenizer.decode(value_tokens)
+                key_embedding=embedding,
+                key=key_text,
+                value=value_text
             )
             result_pairs.append(pair)
         
-        logger.info(f"Created {len(result_pairs)} non-overlapping pairs from article '{title}'")
+        logger.info(f"Created {len(result_pairs)} pairs from article '{title}'")
         return result_pairs
         
     except ValueError as e:
-        # Article was too short
-        logger.warning(f"Article '{title}' is too short: {str(e)}")
+        logger.warning(f"Article '{title}' processing error: {str(e)}")
         return []
     except Exception as e:
-        # Other errors
         logger.error(f"Error processing article '{title}': {e}")
         return []
-
-def process_articles(
-    wiki_iterator: Iterator[Dict[str, Any]],
-    num_articles: int = 5,
-    tokenizer_name: str = MODEL_NAME,
-    key_token_count: int = KEY_TOKEN_COUNT,
-    batch_size: int = 10
-) -> List[List[KeyValuePair]]:
-    """
-    Process multiple articles from the Wikipedia dataset.
-    
-    Args:
-        wiki_iterator: Iterator over Wikipedia articles
-        num_articles: Number of articles to process
-        tokenizer_name: Name of the tokenizer model to use
-        key_token_count: Size of key chunks in tokens
-        batch_size: Number of articles to process in a batch
-        
-    Returns:
-        List of lists of KeyValuePair objects
-    """
-    # Previously named batch_process_articles
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    # Process articles in batches
-    all_kv_pairs = []
-    articles_processed = 0
-    
-    while articles_processed < num_articles:
-        # Process a batch of articles
-        batch_kv_pairs = process_articles_stream(
-            wiki_iterator=wiki_iterator,
-            tokenizer=tokenizer,
-            chunk_size=key_token_count,
-            min_chunks_per_article=10,
-            max_pairs=MAX_PAIRS
-        )
-        
-        if not batch_kv_pairs:
-            # No more articles available
-            break
-        
-        # Add processed articles
-        all_kv_pairs.extend(batch_kv_pairs)
-        articles_processed += len(batch_kv_pairs)
-        
-        logger.info(f"Processed {articles_processed}/{num_articles} articles")
-    
-    return all_kv_pairs
-
-def process_article_text(
-    article_text: str,
-    tokenizer,
-    model,
-    title: str = "Wikipedia Article",
-    max_pairs: int = MAX_PAIRS,
-    should_compute_embeddings: bool = True
-) -> Dict[str, Any]:
-    """
-    Process article text into key-value pairs.
-    
-    Args:
-        article_text: Text of the article
-        tokenizer: Tokenizer to use
-        model: Language model for computing embeddings (required)
-        title: Title of the article
-        max_pairs: Maximum number of key-value pairs to create
-        should_compute_embeddings: Whether to compute key embeddings
-    
-    Returns:
-        Dictionary with title, key-value pairs, and key embeddings
-    
-    Raises:
-        ValueError: If the article is too short to create chunks
-    """
-    logger.info("Processing article text into key-value pairs")
-    
-    # Generate chunks
-    chunks = tokenize_article_into_chunks(
-        article_text, 
-        tokenizer, 
-        chunk_size=KEY_TOKEN_COUNT,
-        max_chunks=max_pairs * 2  # Need twice as many chunks as pairs
-    )
-    
-    # Create WikiArticle object (now with batched structure)
-    wiki_article = WikiArticle(titles=[title], chunks_list=[chunks], texts=[article_text])
-    
-    # Create key-value pairs
-    pairs = create_key_value_pairs_from_chunks(
-        chunks=wiki_article.chunks_list[0],
-        max_pairs=max_pairs,
-        random_selection=True  # Explicitly use random selection
-    )
-    
-    if not pairs:
-        logger.warning("No key-value pairs could be created from the article")
-        return {
-            "title": title,
-            "pairs": [],
-            "key_embeddings": {}
-        }
-    
-    # Decode tokens to text
-    text_pairs = []
-    key_texts = []
-    
-    for key_tokens, value_tokens in pairs:
-        key_text = tokenizer.decode(key_tokens)
-        value_text = tokenizer.decode(value_tokens)
-        
-        text_pairs.append((key_text, value_text))
-        key_texts.append(key_text)
-    
-    # Compute embeddings for keys if requested
-    key_embeddings = {}
-    if should_compute_embeddings and key_texts:
-        logger.info(f"Computing embeddings for {len(key_texts)} keys")
-        embeddings = compute_embeddings(key_texts, model=model, are_queries=False)
-        
-        for i, embedding in enumerate(embeddings):
-            key_embeddings[f"key_{i}"] = embedding
-    
-    # Return processed data
-    result = {
-        "title": title,
-        "pairs": text_pairs,
-        "key_embeddings": key_embeddings
-    }
-    
-    logger.info(f"Article processed with {len(text_pairs)} key-value pairs")
-    return result
-
-def process_next_article(
-    wiki_iterator: 'WikipediaIterator',
-    model,  # Required parameter
-    max_pairs: int = MAX_PAIRS,
-    tokenizer_name: str = MODEL_NAME,
-    device: str = None
-) -> Dict[str, Any]:
-    """
-    Process the next article from a Wikipedia iterator.
-    
-    Args:
-        wiki_iterator: Iterator for Wikipedia articles
-        model: Language model to use for embeddings (required)
-        max_pairs: Maximum number of key-value pairs
-        tokenizer_name: Name of the tokenizer model to use
-        device: Device to load the model on (cpu or cuda)
-        
-    Returns:
-        Processed article data
-    """
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    # Get next article
-    title, text = next_article(wiki_iterator)
-    
-    if not text:
-        logger.error("Failed to get next article")
-        return {
-            "title": title or "Unknown",
-            "pairs": [],
-            "key_embeddings": {}
-        }
-    
-    # Process the article
-    data = process_article_text(
-        article_text=text, 
-        tokenizer=tokenizer, 
-        model=model,
-        title=title, 
-        max_pairs=max_pairs, 
-        should_compute_embeddings=True
-    )
-    data["title"] = title  # Use the actual title
-    
-    return data
-
-def load_wikipedia_article(
-    title: str = WIKI_ARTICLE_TITLE,
-    max_pairs: int = MAX_PAIRS,
-    tokenizer_name: str = MODEL_NAME,
-    device: str = None
-) -> List[KeyValuePair]:
-    """
-    Load a Wikipedia article and convert it to a list of KeyValuePair objects.
-    
-    Args:
-        title: Title of the Wikipedia article
-        max_pairs: Maximum number of key-value pairs
-        tokenizer_name: Name of the tokenizer model to use
-        device: Device to load the model on (cpu or cuda)
-        
-    Returns:
-        List of KeyValuePair objects
-    """
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    # Load language model
-    from src.model import load_language_model
-    model = load_language_model(device=device)
-    
-    # Try to fetch from Wikipedia API first as it's more direct for a known title
-    logger.info(f"Fetching article with title: {title}")
-    article_text = fetch_from_wikipedia_api(title)
-    
-    if article_text:
-        # Process the article using the batch processing helper
-        kv_pairs = process_article(
-            title=title,
-            article_text=article_text,
-            tokenizer=tokenizer,
-            model=model,
-            chunk_size=KEY_TOKEN_COUNT,
-            min_chunks_per_article=max_pairs // 2  # Need half as many chunks as max_pairs for non-overlapping pairs
-        )
-        if kv_pairs:
-            return kv_pairs
-    
-    # If API fetch failed, fall back to the dataset search
-    logger.info(f"API fetch failed, searching for '{title}' in dataset")
-    
-    # Create wiki iterator
-    wiki_iterator = create_wiki_dataset_iterator()
-    
-    # Search through articles to find one with matching title
-    title_lower = title.lower()
-    
-    while True:
-        try:
-            current_title, current_text = next_article(wiki_iterator)
-            
-            # Check if title matches (case insensitive)
-            if current_title.lower() == title_lower:
-                kv_pairs = process_article(
-                    title=current_title,
-                    article_text=current_text,
-                    tokenizer=tokenizer,
-                    model=model,
-                    chunk_size=KEY_TOKEN_COUNT,
-                    min_chunks_per_article=max_pairs // 2
-                )
-                # Always return the result, even if empty
-                return kv_pairs
-                
-        except (StopIteration, Exception) as e:
-            # End of dataset or error
-            break
-    
-    # If article not found, return an empty list
-    logger.error(f"Article '{title}' not found")
-    return []
-
-def load_random_wikipedia_article(
-    max_pairs: int = MAX_PAIRS,
-    tokenizer_name: str = MODEL_NAME,
-    device: str = None
-) -> List[KeyValuePair]:
-    """
-    Load a random Wikipedia article and convert it to a list of KeyValuePair objects.
-    
-    Args:
-        max_pairs: Maximum number of key-value pairs
-        tokenizer_name: Name of the tokenizer model to use
-        device: Device to load the model on (cpu or cuda)
-        
-    Returns:
-        List of KeyValuePair objects
-    """
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    
-    # Load language model
-    from src.model import load_language_model
-    model = load_language_model(device=device)
-    
-    # Create iterator
-    wiki_iterator = create_wiki_dataset_iterator()
-    
-    # Try to find a suitable article
-    while True:
-        try:
-            # Get next article
-            title, article_text = next_article(wiki_iterator)
-            if not title or not article_text:
-                break
-                
-            # Try to process it
-            kv_pairs = process_article(
-                title=title,
-                article_text=article_text,
-                tokenizer=tokenizer,
-                model=model,
-                chunk_size=KEY_TOKEN_COUNT,
-                min_chunks_per_article=max_pairs // 2
-            )
-            
-            # Return the first suitable article
-            if kv_pairs:
-                logger.info(f"Loaded random article: {title} with {len(kv_pairs)} pairs")
-                return kv_pairs
-                
-        except (StopIteration, Exception) as e:
-            # End of articles or error
-            if not isinstance(e, StopIteration):
-                logger.error(f"Error loading random article: {e}")
-            break
-    
-    # If no suitable article found
-    logger.error("Failed to find a suitable random article")
-    return []
 
 def process_articles_stream(
     wiki_iterator, 
     tokenizer,
-    chunk_size: int,
-    min_chunks_per_article: int = 10,
-    max_pairs: int = MAX_PAIRS
+    model,
+    chunk_size: int = KEY_TOKEN_COUNT,
+    max_pairs: int = MAX_PAIRS,
+    non_overlapping: bool = True,
+    random_selection: bool = True,
+    batch_size: int = 1  # New parameter for batching
 ) -> Iterator[List[KeyValuePair]]:
     """
     Process a stream of Wikipedia articles, yielding KeyValuePair lists.
     
-    This function processes articles one by one and yields a list of KeyValuePair
-    objects for each successfully processed article.
-    
     Args:
         wiki_iterator: Iterator yielding Wikipedia articles
         tokenizer: Tokenizer to use for processing text
+        model: Language model to use for computing embeddings
         chunk_size: Size of each chunk in tokens
-        min_chunks_per_article: Minimum number of chunks required per article
         max_pairs: Maximum number of key-value pairs to create per article
+        non_overlapping: Whether to create non-overlapping pairs
+        random_selection: Whether to randomly select pairs
+        batch_size: Number of articles to process in a batch (1 = no batching)
         
     Yields:
         List of KeyValuePair objects for each processed article
     """
     logger.info(f"Processing Wikipedia articles stream with chunk_size={chunk_size}")
     
-    # Load language model
-    from src.model import load_language_model
-    model = load_language_model(device=None)  # Use default device
-    
     while True:
         try:
-            # Get next article
-            title, article_text = next_article(wiki_iterator)
-            if not title or not article_text:
-                break
+            if batch_size <= 1:
+                # Single article processing (original behavior)
+                title, article_text = next_article(wiki_iterator)
+                if not title or not article_text:
+                    break
+                    
+                pairs = process_article(
+                    title=title,
+                    article_text=article_text,
+                    tokenizer=tokenizer,
+                    model=model,
+                    chunk_size=chunk_size,
+                    max_pairs=max_pairs,
+                    non_overlapping=non_overlapping,
+                    random_selection=random_selection
+                )
                 
-            logger.info(f"Processing article: {title}")
-            
-            # Process the article
-            kv_pairs = process_article(
+                if pairs:
+                    yield pairs
+            else:
+                # Batch processing
+                batch_articles = []
+                for _ in range(batch_size):
+                    try:
+                        title, article_text = next_article(wiki_iterator)
+                        if title and article_text:
+                            batch_articles.append((title, article_text))
+                    except StopIteration:
+                        break
+                
+                if not batch_articles:
+                    break
+                
+                # Process each article in the batch and yield non-empty results
+                for title, article_text in batch_articles:
+                    pairs = process_article(
+                        title=title,
+                        article_text=article_text,
+                        tokenizer=tokenizer,
+                        model=model,
+                        chunk_size=chunk_size,
+                        max_pairs=max_pairs,
+                        non_overlapping=non_overlapping,
+                        random_selection=random_selection
+                    )
+                    
+                    if pairs:
+                        yield pairs
+                
+        except StopIteration:
+            break
+        except Exception as e:
+            logger.error(f"Error processing articles stream: {e}")
+            continue
+
+def load_wikipedia_article(
+    title: str = None,  # None = random article
+    tokenizer_name: str = MODEL_NAME,
+    device: str = None,
+    max_pairs: int = MAX_PAIRS,
+    non_overlapping: bool = True,
+    random_selection: bool = True
+) -> List[KeyValuePair]:
+    """
+    Load a Wikipedia article and convert it to KeyValuePair objects.
+    If title is None, loads a random article.
+    
+    Args:
+        title: Title of the Wikipedia article (None for random)
+        tokenizer_name: Name of the tokenizer model to use
+        device: Device to load the model on (cpu or cuda)
+        max_pairs: Maximum number of key-value pairs
+        non_overlapping: Whether to create non-overlapping pairs
+        random_selection: Whether to randomly select pairs
+        
+    Returns:
+        List of KeyValuePair objects
+    """
+    # Load tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    from src.model import load_language_model
+    model = load_language_model(device=device)
+    
+    if title:
+        # Try to fetch from Wikipedia API first
+        article_text = fetch_from_wikipedia_api(title)
+        
+        if article_text:
+            return process_article(
                 title=title,
                 article_text=article_text,
                 tokenizer=tokenizer,
                 model=model,
-                chunk_size=chunk_size,
-                min_chunks_per_article=min_chunks_per_article
+                max_pairs=max_pairs,
+                non_overlapping=non_overlapping,
+                random_selection=random_selection
             )
-            
-            # Skip if processing failed
-            if not kv_pairs:
+    
+    # If title is None or API fetch failed, use the dataset
+    wiki_iterator = create_wiki_dataset_iterator()
+    
+    while True:
+        try:
+            curr_title, curr_text = next_article(wiki_iterator)
+            if not curr_title or not curr_text:
+                break
+                
+            # If searching for specific title, check match
+            if title and curr_title.lower() != title.lower():
                 continue
                 
-            # Yield the processed article
-            logger.info(f"Yielding processed article: {title} with {len(kv_pairs)} pairs")
-            yield kv_pairs
+            pairs = process_article(
+                title=curr_title,
+                article_text=curr_text,
+                tokenizer=tokenizer,
+                model=model,
+                max_pairs=max_pairs,
+                non_overlapping=non_overlapping,
+                random_selection=random_selection
+            )
+            
+            if pairs:
+                return pairs
                 
-        except (StopIteration, Exception) as e:
-            # End of articles or other error
-            if not isinstance(e, StopIteration):
-                logger.error(f"Error processing articles: {e}")
+        except (StopIteration, Exception):
             break
-
-def create_embedding(text: str, model) -> np.ndarray:
-    """
-    Create an embedding vector for the given text.
     
-    Args:
-        text: The text to create an embedding for
-        model: Language model for computing embeddings (required)
-        
-    Returns:
-        Numpy array containing the embedding vector
-    """
-    # Compute embedding for single text
-    embeddings = compute_embeddings([text], model=model, are_queries=False)
-    return embeddings[0] 
+    # If no article found/processed
+    logger.error(f"Failed to load article{f' with title {title}' if title else ''}")
+    return [] 

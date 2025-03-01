@@ -9,7 +9,7 @@ import numpy as np
 from unittest.mock import patch, MagicMock
 
 from src.model import LanguageModel
-from src.embeddings import compute_embeddings, get_embeddings, get_embedding, normalize_embedding
+from src.embeddings import compute_embeddings, get_embeddings, get_embedding
 
 @pytest.fixture(scope="module")
 def language_model():
@@ -133,9 +133,15 @@ def test_similarity_between_embeddings(language_model):
     embedding1 = embedding1 / np.linalg.norm(embedding1)
     
     embedding2 = get_embedding(text2, model=language_model)
+    # Ensure embedding2 is 1D if it's 2D
+    if embedding2.ndim > 1:
+        embedding2 = embedding2.squeeze()
     embedding2 = embedding2 / np.linalg.norm(embedding2)
     
     embedding3 = get_embedding(text3, model=language_model)
+    # Ensure embedding3 is 1D if it's 2D
+    if embedding3.ndim > 1:
+        embedding3 = embedding3.squeeze()
     embedding3 = embedding3 / np.linalg.norm(embedding3)
     
     # Compute similarities
@@ -143,8 +149,6 @@ def test_similarity_between_embeddings(language_model):
     sim_1_3 = np.dot(embedding1, embedding3)
     sim_2_3 = np.dot(embedding2, embedding3)
     
-    # Instead of asserting specific relationships which can be unstable,
-    # just verify that the similarities are in a reasonable range
-    assert 0 <= sim_1_2 <= 1
-    assert 0 <= sim_1_3 <= 1
-    assert 0 <= sim_2_3 <= 1 
+    # Check that similarity between related concepts is higher
+    assert sim_1_2 > sim_1_3, f"Expected similarity between AI questions to be higher than unrelated topics, but got {sim_1_2} <= {sim_1_3}"
+    assert sim_1_2 > sim_2_3, f"Expected similarity between AI questions to be higher than unrelated topics, but got {sim_1_2} <= {sim_2_3}" 
