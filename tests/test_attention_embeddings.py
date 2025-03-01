@@ -72,10 +72,8 @@ def test_attention_query_embedding(language_model):
     assert query_embedding.shape[0] > 0
     assert np.linalg.norm(query_embedding) > 0
     
-    # Test non-normalized version too
-    raw_query = compute_attention_query_embedding(query_text, model=language_model, normalize=False)
-    assert isinstance(raw_query, np.ndarray)
-    assert np.linalg.norm(raw_query) > 0
+    # We no longer test normalized vs non-normalized versions since we've
+    # standardized on using scaled dot product attention without normalization
 
 def test_embedding_similarities(language_model):
     """Test similarities between different embedding types."""

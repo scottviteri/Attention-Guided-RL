@@ -241,46 +241,39 @@ def get_embedding(
     is_query: bool = True,
     use_cache: bool = True,
     cache_dir: str = DEFAULT_CACHE_DIR,
-    max_length: int = 512,
-    normalize: bool = True
+    max_length: int = 512
 ) -> np.ndarray:
     """
-    Get embedding for a single text.
+    Get embedding for a single text string, with optional caching.
     
     Args:
         text: Text to embed
         model: Language model
-        is_query: Whether text is a query (vs key)
+        is_query: Whether this is a query (True) or a key (False)
         use_cache: Whether to use cache
-        cache_dir: Cache directory
+        cache_dir: Directory for cache
         max_length: Maximum token length
-        normalize: Whether to normalize the embedding
         
     Returns:
         Embedding array
     """
-    if not text:
-        return np.array([])
-    
-    # Determine cache subdirectory based on text type
-    text_type_dir = os.path.join(cache_dir, "queries" if is_query else "keys")
-    
-    # Check cache if enabled
     if use_cache:
-        cached_embedding = load_from_cache(text, text_type_dir)
-        if cached_embedding is not None:
-            return cached_embedding
-    
-    # Compute embedding based on text type
+        # Try to load from cache first
+        cached = load_from_cache(text, cache_dir)
+        if cached is not None:
+            return cached
+            
+    # Compute embedding based on type
     if is_query:
-        embedding = compute_attention_query_embedding(text, model, max_length, normalize)
+        embedding = compute_attention_query_embedding(text, model, max_length)
     else:
+        # For keys, use the standard embedding
         embedding = compute_llama_embedding(text, model, max_length)
-    
+        
     # Save to cache if enabled
     if use_cache:
-        save_to_cache(text, embedding, text_type_dir)
-    
+        save_to_cache(text, embedding, cache_dir)
+        
     return embedding
 
 def compute_embeddings_batch(texts: List[str], model: LanguageModel, max_length: int = 512) -> List[np.ndarray]:
@@ -448,7 +441,8 @@ def compute_similarity(
     key_embeddings: Dict[str, np.ndarray]
 ) -> Dict[str, float]:
     """
-    Compute cosine similarity between query embedding and key embeddings.
+    Compute dot product similarity between query embedding and key embeddings,
+    scaled by sqrt(d) where d is the embedding dimension.
     
     Args:
         query_embedding: Query embedding vector (not normalized)
@@ -457,34 +451,27 @@ def compute_similarity(
     Returns:
         Dictionary of key IDs to similarity scores
     """
-    # Compute cosine similarity for each key
+    # Compute similarity for each key
     similarities = {}
     
     # Flatten query embedding if it's multi-dimensional
     if query_embedding.ndim > 1:
         query_embedding = query_embedding.flatten()
     
-    # Compute query norm for cosine similarity
-    query_norm = np.linalg.norm(query_embedding)
+    # Get the dimension for scaling
+    d = query_embedding.shape[0]
+    scaling_factor = np.sqrt(d)
     
     for key_id, key_embedding in key_embeddings.items():
         # Flatten key embedding if it's multi-dimensional
         if key_embedding.ndim > 1:
             key_embedding = key_embedding.flatten()
             
-        # Compute key norm
-        key_norm = np.linalg.norm(key_embedding)
+        # Compute scaled dot product (no normalization)
+        similarity = np.dot(query_embedding, key_embedding) / scaling_factor
         
-        # Compute cosine similarity (handle zero norms to avoid division by zero)
-        if query_norm > 0 and key_norm > 0:
-            similarity = np.dot(query_embedding, key_embedding) / (query_norm * key_norm)
-        else:
-            similarity = 0.0
-        
-        # Ensure value is in valid range
-        similarity = max(0.0, min(1.0, float(similarity)))
-        
-        similarities[key_id] = similarity
+        # Convert to float for serialization
+        similarities[key_id] = float(similarity)
     
     return similarities
 
@@ -685,7 +672,7 @@ def compute_attention_key_embedding(text: str, model: 'LanguageModel', max_lengt
     # Process activations
     return process_attention_activations(activations, inputs["attention_mask"])
 
-def compute_attention_query_embedding(text: str, model: 'LanguageModel', max_length: int = 512, normalize: bool = True) -> np.ndarray:
+def compute_attention_query_embedding(text: str, model: 'LanguageModel', max_length: int = 512) -> np.ndarray:
     """
     Compute embedding for an attention query.
     Extracts query projection activations from the model's attention layers.
@@ -694,7 +681,6 @@ def compute_attention_query_embedding(text: str, model: 'LanguageModel', max_len
         text: Text to embed
         model: Language model
         max_length: Maximum token length
-        normalize: Whether to normalize the embedding
         
     Returns:
         Embedding array
@@ -707,10 +693,6 @@ def compute_attention_query_embedding(text: str, model: 'LanguageModel', max_len
     
     # Process activations
     embedding = process_attention_activations(activations, inputs["attention_mask"])
-    
-    # Normalize if requested
-    if normalize:
-        embedding = normalize_embedding(embedding)
         
     return embedding
 
@@ -815,35 +797,75 @@ def compute_attention_key_embeddings_batch(texts: List[str], model: 'LanguageMod
 def compute_attention_query_embeddings_batch(
     texts: List[str], 
     model: 'LanguageModel', 
-    max_length: int = 512,
-    normalize: bool = True
+    max_length: int = 512
 ) -> List[np.ndarray]:
     """
-    Compute attention query embeddings for multiple texts in a single batch.
+    Compute embeddings for a batch of attention queries.
+    Extracts query projection activations from the model's attention layers.
     
     Args:
         texts: List of texts to embed
         model: Language model
         max_length: Maximum token length
-        normalize: Whether to normalize embeddings
         
     Returns:
-        List of query embedding arrays
+        List of embedding arrays
     """
-    if not texts:
-        return []
-    
-    # Tokenize all texts in a batch
+    # Tokenize inputs
     inputs = tokenize_text_batch(texts, model.tokenizer, max_length, model.device)
     
     # Extract query activations
     activations = extract_attention_activations_batch(inputs, model, "query")
     
-    # Process activations
-    batch_embeddings = process_attention_activations(activations, inputs["attention_mask"])
-    
-    # Convert to list of numpy arrays and normalize if requested
-    if normalize:
-        return [normalize_embedding(batch_embeddings[i]) for i in range(len(texts))]
+    # Process activations 
+    # If we have a list of activations, process each one and take the mean
+    if activations and isinstance(activations, list):
+        # Process and average each activation tensor
+        processed_activations = []
+        for activation in activations:
+            # Apply attention mask and get mean over tokens
+            batch_size = activation.shape[0]
+            
+            # Reshape if needed to match attention mask
+            if activation.dim() > 3:
+                # Flatten the attention heads dimension
+                activation = activation.reshape(batch_size, activation.shape[1], -1)
+                
+            # Apply attention mask
+            expanded_mask = inputs["attention_mask"].unsqueeze(-1).expand(-1, -1, activation.shape[-1])
+            token_count = inputs["attention_mask"].sum(dim=1, keepdim=True).unsqueeze(-1)
+            masked_activation = activation * expanded_mask
+            mean_activation = masked_activation.sum(dim=1) / token_count
+            
+            processed_activations.append(mean_activation)
+            
+        # Stack and average over layers
+        all_layers = torch.stack(processed_activations)
+        avg_embeddings = torch.mean(all_layers, dim=0)
+        batch_embeddings = avg_embeddings.cpu().numpy()
+    elif activations:
+        # We received a single activation tensor, process it directly
+        activation = activations[-1] if isinstance(activations, list) else activations
+        
+        # Apply attention mask
+        batch_size = activation.shape[0]
+        expanded_mask = inputs["attention_mask"].unsqueeze(-1).expand(-1, -1, activation.shape[-1])
+        token_count = inputs["attention_mask"].sum(dim=1, keepdim=True).unsqueeze(-1)
+        masked_activation = activation * expanded_mask
+        mean_activation = masked_activation.sum(dim=1) / token_count
+        
+        batch_embeddings = mean_activation.cpu().numpy()
     else:
-        return [batch_embeddings[i] for i in range(len(texts))] 
+        # No activations captured, return empty arrays
+        batch_embeddings = np.zeros((len(texts), 1))
+    
+    # Ensure each embedding is 1D
+    result = []
+    for i in range(len(texts)):
+        # Flatten if necessary to ensure 1D
+        if batch_embeddings[i].ndim > 1:
+            result.append(batch_embeddings[i].flatten())
+        else:
+            result.append(batch_embeddings[i])
+            
+    return result 

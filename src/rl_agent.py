@@ -27,8 +27,7 @@ from src.embeddings import (
     extract_attention_activations, 
     extract_attention_activations_batch,
     compute_attention_query_embedding,
-    compute_similarity,
-    normalize_embedding
+    compute_similarity
 )
 from src.utils import (
     softmax,
@@ -91,6 +90,7 @@ def select_value_with_attention(
 ) -> Tuple[str, str, List[KeyValuePair]]:
     """
     Select a key-value pair from the database using attention-based similarity.
+    Uses scaled dot product attention (scaled by sqrt(d)) instead of normalization.
     
     Args:
         query: Query string to match against keys
@@ -105,20 +105,20 @@ def select_value_with_attention(
     if not database:
         return "", "", []
     
-    # Compute query embedding
+    # Compute query embedding (without normalization)
     query_embedding = compute_attention_query_embedding(query, model)
     
     # Get all keys from the database
     keys = [pair.key for pair in database]
     key_ids = [pair.key_id for pair in database]
     
-    # Compute key embeddings
+    # Compute key embeddings (without normalization)
     key_embeddings = {}
     for i, key in enumerate(keys):
-        key_embedding = compute_attention_query_embedding(key, model, normalize=True)
+        key_embedding = compute_attention_query_embedding(key, model)
         key_embeddings[key_ids[i]] = key_embedding
     
-    # Compute similarities
+    # Compute similarities (now using scaled dot product)
     similarities = compute_similarity(query_embedding, key_embeddings)
     
     # Convert to list for sampling

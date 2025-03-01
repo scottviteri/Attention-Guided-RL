@@ -11,6 +11,7 @@ from collections import deque
 import logging
 import time
 from typing import Dict, List, Tuple, Any, Optional, Union
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(
@@ -36,7 +37,8 @@ def ensure_dir(directory: str) -> None:
 
 def softmax(x: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """
-    Compute softmax values for array of scores.
+    Compute softmax values for array of scores using torch's implementation
+    for better numerical stability.
     
     Args:
         x: Array of scores
@@ -45,9 +47,14 @@ def softmax(x: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     Returns:
         Softmax probabilities
     """
-    x = x / temperature
-    e_x = np.exp(x - np.max(x))  # Subtract max for numerical stability
-    return e_x / e_x.sum()
+    # Convert to torch tensor
+    x_tensor = torch.tensor(x / temperature, dtype=torch.float32)
+    
+    # Use torch's numerically stable softmax
+    probs_tensor = F.softmax(x_tensor, dim=0)
+    
+    # Convert back to numpy
+    return probs_tensor.numpy()
 
 def sample_from_distribution(probs: np.ndarray) -> int:
     """
