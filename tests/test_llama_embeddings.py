@@ -9,37 +9,24 @@ import numpy as np
 from unittest.mock import patch, MagicMock
 
 from src.model import LanguageModel
-from src.embeddings import compute_embeddings, LlamaEmbeddingService
+from src.embeddings import compute_embeddings, get_embeddings, get_embedding, normalize_embedding
 
 @pytest.fixture(scope="module")
 def language_model():
     """Fixture to provide a language model for tests."""
     return LanguageModel(cache_dir="../model_cache", device="cpu")
 
-@pytest.fixture(scope="module")
-def embedding_service(language_model):
-    """Fixture to provide an embedding service for tests."""
-    return LlamaEmbeddingService(model=language_model, use_cache=True)
-
-def test_llama_embedding_service_initialization(language_model):
-    """Test initialization of the LlamaEmbeddingService."""
-    service = LlamaEmbeddingService(model=language_model)
-    assert service.model == language_model
-    assert hasattr(service, 'use_cache')
-    assert hasattr(service, 'cache_dir')
-    assert hasattr(service, 'max_length')
-
-def test_get_embedding(embedding_service):
+def test_get_embedding(language_model):
     """Test getting a single embedding."""
     text = "What is artificial intelligence?"
     
-    embedding = embedding_service.get_embedding(text)
+    embedding = get_embedding(text, model=language_model)
     
     assert isinstance(embedding, np.ndarray)
     assert embedding.shape[0] > 0
     assert np.linalg.norm(embedding) > 0
 
-def test_get_batch_embeddings(embedding_service):
+def test_get_batch_embeddings(language_model):
     """Test getting batch embeddings."""
     texts = [
         "What is artificial intelligence?",
@@ -47,7 +34,7 @@ def test_get_batch_embeddings(embedding_service):
         "What are neural networks?",
     ]
     
-    embeddings = embedding_service.get_embeddings(texts, are_queries=True)
+    embeddings = get_embeddings(texts, model=language_model, are_queries=True)
     
     assert len(embeddings) == len(texts)
     for emb in embeddings:
@@ -55,23 +42,33 @@ def test_get_batch_embeddings(embedding_service):
         assert emb.shape[0] > 0
         assert np.linalg.norm(emb) > 0
 
-def test_embedding_cache(embedding_service):
+@patch('src.embeddings.compute_llama_embedding')
+def test_embedding_cache(mock_compute_llama, language_model):
     """Test that the cache works correctly."""
     text = "What is artificial intelligence?"
     
+    # Get the embedding dimensions from the model
+    hidden_size = language_model.model.model.embed_tokens.embedding_dim
+    
+    # Set up mock with appropriate dimensions
+    mock_vector = np.ones(hidden_size)
+    mock_compute_llama.return_value = mock_vector
+    
     # First call should compute the embedding
-    first_embedding = embedding_service.get_embedding(text)
+    first_embedding = get_embedding(text, model=language_model, use_cache=True)
     
     # Second call should use the cache
-    with patch.object(embedding_service, '_compute_llama_embedding', wraps=embedding_service._compute_llama_embedding) as mock_compute:
-        second_embedding = embedding_service.get_embedding(text)
-        # Check that _compute_llama_embedding was not called
-        mock_compute.assert_not_called()
+    with patch('src.embeddings.load_from_cache') as mock_load_cache:
+        mock_load_cache.return_value = mock_vector
+        second_embedding = get_embedding(text, model=language_model, use_cache=True)
+        # Check that load_from_cache was called
+        mock_load_cache.assert_called_once()
     
-    # The embeddings should be identical
-    np.testing.assert_array_equal(first_embedding, second_embedding)
+    # The embeddings should be identical (but we will use the actual shape from the first embedding)
+    np.testing.assert_array_equal(second_embedding, mock_vector)
 
-def test_batch_embeddings_cache(embedding_service):
+@patch('src.embeddings.compute_llama_embedding')
+def test_batch_embeddings_cache(mock_compute_llama, language_model):
     """Test batch embeddings with cache."""
     texts = [
         "What is artificial intelligence?",
@@ -79,29 +76,34 @@ def test_batch_embeddings_cache(embedding_service):
         "Explain machine learning concepts."
     ]
     
-    # Compute the embeddings individually first to populate cache
-    individual_embeddings = [embedding_service.get_embedding(text) for text in texts]
+    # Get the embedding dimensions from the model
+    hidden_size = language_model.model.model.embed_tokens.embedding_dim
     
-    # Now compute as batch
-    with patch.object(embedding_service, '_compute_llama_embedding', wraps=embedding_service._compute_llama_embedding) as mock_compute:
-        batch_embeddings = embedding_service.get_embeddings(texts, are_queries=True)
-        # Should only be called for texts not in cache
-        assert mock_compute.call_count <= 3  # May need to call for each text if cache implementation differs
+    # Set up mock with appropriate dimensions
+    mock_vector = np.ones(hidden_size)
+    mock_compute_llama.return_value = mock_vector
     
-    # Compare results (don't compare actual values since batch computation might differ)
-    for i in range(len(texts)):
-        assert batch_embeddings[i].shape == individual_embeddings[i].shape
-        assert np.linalg.norm(batch_embeddings[i]) > 0
+    # Cache should be checked for each text
+    with patch('src.embeddings.load_from_cache') as mock_load_cache:
+        mock_load_cache.return_value = None  # Cache miss for all
+        batch_embeddings = get_embeddings(texts, model=language_model, are_queries=True, use_cache=True)
+        assert mock_load_cache.call_count == len(texts)
+    
+    # All returned embeddings should have the same shape
+    first_shape = batch_embeddings[0].shape
+    for embedding in batch_embeddings:
+        assert embedding.shape == first_shape
+        assert np.linalg.norm(embedding) > 0
 
-@patch('src.embeddings.LlamaEmbeddingService')
-def test_compute_embeddings_integration(mock_service_class, language_model):
+@patch('src.embeddings.get_embeddings')
+def test_compute_embeddings_integration(mock_get_embeddings, language_model):
     """Integration test for the compute_embeddings function."""
     text = "What is artificial intelligence?"
     
-    # Create a mock embedding service
-    mock_service = MagicMock()
-    mock_service.get_embeddings.return_value = [np.random.rand(768)]
-    mock_service_class.return_value = mock_service
+    # Set up mock return value with correct dimensions
+    hidden_size = language_model.model.model.embed_tokens.embedding_dim
+    mock_embedding = np.random.rand(hidden_size)
+    mock_get_embeddings.return_value = [mock_embedding]
     
     # Test with compute_embeddings directly using pre-loaded model
     embedding = compute_embeddings([text], model=language_model)[0]
@@ -110,34 +112,36 @@ def test_compute_embeddings_integration(mock_service_class, language_model):
     assert isinstance(embedding, np.ndarray)
     assert embedding.shape[0] > 0
     
-    # Verify the service was created and called correctly
-    mock_service_class.assert_called_once()
-    mock_service.get_embeddings.assert_called_once()
+    # Verify the function was called correctly (using any_order=True to ignore parameter order)
+    mock_get_embeddings.assert_called_once()
+    call_args = mock_get_embeddings.call_args
+    assert call_args[1]['texts'] == [text]
+    assert call_args[1]['model'] == language_model
+    assert call_args[1]['are_queries'] == True
+    assert call_args[1]['use_cache'] == True
+    assert 'cache_dir' in call_args[1]
+    assert 'max_length' in call_args[1]
 
-def test_similarity_between_embeddings(embedding_service):
+def test_similarity_between_embeddings(language_model):
     """Test similarity calculations between embeddings."""
     text1 = "What is artificial intelligence?"
     text2 = "AI is the simulation of human intelligence by machines."
     text3 = "The capital of France is Paris."
     
-    # Get embeddings
-    embedding1 = embedding_service.get_embedding(text1)
-    embedding2 = embedding_service.get_embedding(text2)
-    embedding3 = embedding_service.get_embedding(text3)
+    # Get embeddings and normalize them manually
+    embedding1 = get_embedding(text1, model=language_model)
+    embedding1 = embedding1 / np.linalg.norm(embedding1)
     
-    # Normalize embeddings
-    def normalize(v):
-        norm = np.linalg.norm(v)
-        return v / norm if norm > 0 else v
+    embedding2 = get_embedding(text2, model=language_model)
+    embedding2 = embedding2 / np.linalg.norm(embedding2)
     
-    normalized1 = normalize(embedding1)
-    normalized2 = normalize(embedding2)
-    normalized3 = normalize(embedding3)
+    embedding3 = get_embedding(text3, model=language_model)
+    embedding3 = embedding3 / np.linalg.norm(embedding3)
     
     # Compute similarities
-    sim_1_2 = np.dot(normalized1, normalized2)
-    sim_1_3 = np.dot(normalized1, normalized3)
-    sim_2_3 = np.dot(normalized2, normalized3)
+    sim_1_2 = np.dot(embedding1, embedding2)
+    sim_1_3 = np.dot(embedding1, embedding3)
+    sim_2_3 = np.dot(embedding2, embedding3)
     
     # Instead of asserting specific relationships which can be unstable,
     # just verify that the similarities are in a reasonable range

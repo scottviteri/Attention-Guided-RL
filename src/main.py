@@ -1,8 +1,6 @@
 """
 Main script for running the reinforcement learning training.
 """
-
-import os
 import time
 import logging
 import argparse
@@ -32,7 +30,7 @@ from src.model import load_language_model
 from src.utils import ensure_dir, plot_rewards
 from src.rl_agent import run_training
 
-# Set up logging
+# Set up basic logging (will be overridden by verbosity settings)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -45,12 +43,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train a reinforcement learning agent on Wikipedia articles")
     
     # Data arguments
-    parser.add_argument("--title", type=str, default=MODEL_NAME,
-                        help="Title of the Wikipedia article to use")
-    parser.add_argument("--random-article", action="store_true",
-                        help="Use a random Wikipedia article instead of a specific title")
+    parser.add_argument("--title", type=str, default=None,
+                        help="Title of the Wikipedia article to use (providing this will use a specific article instead of a random one and automatically set num_episodes=1 and batch_size=1)")
+    parser.add_argument("--random-article", action="store_true", 
+                        help="Use a random Wikipedia article (default behavior)")
     parser.add_argument("--max-pairs", type=int, default=MAX_PAIRS,
                         help="Maximum number of key-value pairs to extract")
+    
+    # Model arguments
+    parser.add_argument("--device", type=str, choices=["cuda", "cpu"], default=None,
+                        help="Device to use for model loading (default: auto-detect)")
     
     # Training arguments
     parser.add_argument("--num-episodes", type=int, default=NUM_EPISODES,
@@ -62,13 +64,22 @@ def parse_args():
     parser.add_argument("--kl-weight", type=float, default=KL_WEIGHT,
                         help="Weight for the KL divergence term in the loss")
     
+    # Logging and output control
+    verbosity_group = parser.add_mutually_exclusive_group()
+    verbosity_group.add_argument("--quiet", action="store_true",
+                        help="Minimize output, show only warnings and errors")
+    verbosity_group.add_argument("--verbose", action="store_true",
+                        help="Enable verbose logging (INFO level)")
+    verbosity_group.add_argument("--debug", action="store_true",
+                        help="Enable debug logging (DEBUG level)")
+    verbosity_group.add_argument("--trace", action="store_true",
+                        help="Enable trace logging (most detailed output)")
+    
     # Misc arguments
     parser.add_argument("--enable-wandb", action="store_true",
                         help="Enable logging to wandb (disabled by default)")
     parser.add_argument("--no-checkpoints", action="store_true",
                         help="Disable saving model checkpoints")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable verbose logging")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable embedding cache")
     parser.add_argument("--output-dir", type=str, default="output",
@@ -77,7 +88,48 @@ def parse_args():
     return parser.parse_args()
 
 
-def setup_logging(args, disable_wandb: bool = False) -> Optional[Dict[str, Any]]:
+def setup_logging(args):
+    """
+    Configure logging based on verbosity level.
+    
+    Args:
+        args: Command line arguments
+    
+    Hierarchy of verbosity (from least to most verbose):
+    - quiet: Only warnings and errors (WARNING)
+    - default: Standard information (INFO)
+    - verbose: More detailed information (still INFO but with additional logs)
+    - debug: Detailed debugging information (DEBUG)
+    - trace: Most detailed output possible (DEBUG with all loggers verbose)
+    """
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    
+    if args.quiet:
+        # Quiet mode - show only warnings and errors
+        logging.basicConfig(level=logging.WARNING, format=log_format, force=True)
+        logger.warning("Quiet mode enabled - showing only warnings and errors")
+    elif args.trace:
+        # Trace mode - show all possible details (most verbose)
+        logging.basicConfig(level=logging.DEBUG, format=log_format, force=True)
+        # Set specific loggers to DEBUG level for maximum verbosity
+        for module in ["src", "transformers", "bitsandbytes"]:
+            logging.getLogger(module).setLevel(logging.DEBUG)
+        logger.debug("Trace logging enabled (most detailed output)")
+    elif args.debug:
+        # Debug mode - show detailed debug information
+        logging.basicConfig(level=logging.DEBUG, format=log_format, force=True)
+        logger.debug("Debug logging enabled")
+    elif args.verbose:
+        # Verbose mode - more detailed information than default
+        logging.basicConfig(level=logging.INFO, format=log_format, force=True)
+        logger.info("Verbose logging enabled - showing detailed information")
+    else:
+        # Default mode - standard information output
+        logging.basicConfig(level=logging.INFO, format=log_format, force=True)
+        logger.info("Standard logging level enabled")
+
+
+def setup_wandb(args, disable_wandb: bool = False) -> Optional[Dict[str, Any]]:
     """Set up logging to wandb."""
     # Ensure output directory exists
     ensure_dir(args.output_dir)
@@ -99,6 +151,8 @@ def setup_logging(args, disable_wandb: bool = False) -> Optional[Dict[str, Any]]
         "random_article": args.random_article,
         "no_checkpoints": args.no_checkpoints,
         "verbose": args.verbose,
+        "debug": args.debug,
+        "trace": args.trace,
         "no_cache": args.no_cache
     }
     
@@ -111,37 +165,58 @@ def main():
     # Parse arguments
     args = parse_args()
     
-    # Configure logging level based on verbose flag
-    if args.verbose:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            force=True
-        )
-        logger.debug("Verbose logging enabled")
+    # If title is provided, automatically set episodes and batch size to 1 for quick testing
+    if args.title:
+        if args.num_episodes != 1:
+            logger.info(f"Title provided, setting num_episodes from {args.num_episodes} to 1")
+            args.num_episodes = 1
+        if args.batch_size != 1:
+            logger.info(f"Title provided, setting batch_size from {args.batch_size} to 1")
+            args.batch_size = 1
     
-    # Set up logging
-    config = setup_logging(args)
+    # Configure logging based on verbosity level
+    setup_logging(args)
+    
+    # Set up wandb if enabled
+    config = setup_wandb(args)
     
     # Load the language model
     logger.info("Loading language model")
-    model = load_language_model()
+    model = load_language_model(device=args.device)
+    if args.device:
+        logger.info(f"Using device: {args.device}")
+    else:
+        logger.info(f"Using device: {model.device} (auto-detected)")
     
     # Load the Wikipedia article
     logger.info("Loading Wikipedia article")
-    if args.random_article:
-        database = load_random_wikipedia_article(max_pairs=args.max_pairs)
-        logger.info(f"Loaded random article with {len(database)} key-value pairs")
-    else:
+    if args.title:
         database = load_wikipedia_article(
             title=args.title,
-            max_pairs=args.max_pairs
+            max_pairs=args.max_pairs,
+            device=args.device
         )
         logger.info(f"Loaded article: {args.title} with {len(database)} key-value pairs")
+    else:
+        # Default behavior: use random article
+        database = load_random_wikipedia_article(
+            max_pairs=args.max_pairs,
+            device=args.device
+        )
+        logger.info(f"Loaded random article with {len(database)} key-value pairs")
     
     # Run training
     logger.info("Starting training")
     start_time = time.time()
+    
+    # Determine verbosity level to pass to run_training
+    verbose_level = 0  # Default
+    if args.trace:
+        verbose_level = 3  # Most verbose
+    elif args.debug:
+        verbose_level = 2  # Debug level
+    elif args.verbose:
+        verbose_level = 1  # Standard verbose
     
     episode_rewards = run_training(
         model=model,
@@ -151,7 +226,7 @@ def main():
         learning_rate=args.learning_rate,
         kl_weight=args.kl_weight,
         disable_checkpoints=args.no_checkpoints,
-        verbose=args.verbose
+        verbose=verbose_level
     )
     
     training_time = time.time() - start_time

@@ -1,0 +1,57 @@
+from typing import Dict, Any
+from transformers import AutoTokenizer
+from src.model import load_language_model
+from src.utils import next_article, process_article_text
+from src.config import MAX_PAIRS, MODEL_NAME
+from src.logger import logger
+
+def process_next_article(
+    wiki_iterator: 'WikipediaIterator', 
+    max_pairs: int = MAX_PAIRS,
+    tokenizer_name: str = MODEL_NAME,
+    model = None,
+    device: str = None
+) -> Dict[str, Any]:
+    """
+    Process the next article from a Wikipedia iterator.
+    
+    Args:
+        wiki_iterator: Iterator for Wikipedia articles
+        max_pairs: Maximum number of key-value pairs
+        tokenizer_name: Name of the tokenizer model to use
+        model: Language model to use (will be loaded if None)
+        device: Device to load the model on (cpu or cuda)
+        
+    Returns:
+        Processed article data
+    """
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    
+    # Load language model
+    if model is None:
+        model = load_language_model(device=device)
+    
+    # Get next article
+    title, text = next_article(wiki_iterator)
+    
+    if not text:
+        logger.error("Failed to get next article")
+        return {
+            "title": title or "Unknown",
+            "pairs": [],
+            "key_embeddings": {}
+        }
+    
+    # Process the article
+    data = process_article_text(
+        article_text=text, 
+        tokenizer=tokenizer, 
+        model=model,
+        title=title, 
+        max_pairs=max_pairs, 
+        should_compute_embeddings=True
+    )
+    data["title"] = title  # Use the actual title
+    
+    return data 

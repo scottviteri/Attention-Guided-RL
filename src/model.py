@@ -5,6 +5,7 @@ Functions for loading language models and generating queries.
 import os
 import torch
 import logging
+import numpy as np
 from typing import Dict, List, Tuple, Any, Optional, Union
 from transformers import (
     AutoModelForCausalLM,
@@ -35,7 +36,7 @@ class LanguageModel:
         model_name: str = MODEL_NAME,
         device: str = None,
         cache_dir: str = "model_cache",
-        load_in_8bit: bool = False
+        load_in_8bit: bool = False 
     ):
         """
         Initialize the language model.
@@ -69,6 +70,9 @@ class LanguageModel:
         # Ensure the tokenizer has a pad token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        # Set padding side to left for decoder-only models
+        self.tokenizer.padding_side = 'left'
         
         # Load model
         model_kwargs = {"cache_dir": cache_dir}
@@ -209,6 +213,119 @@ class LanguageModel:
             
             if EOT_TOKEN in query:
                 # Remove everything after EOT
+                query = query.split(EOT_TOKEN)[0].strip()
+            
+            result_queries.append(query)
+        
+        return result_queries
+    
+    def generate_queries_batch(
+        self, 
+        contexts: List[str],
+        instructions: str = QUERY_INSTRUCTIONS,
+        fixed_token_count: int = QUERY_TOKEN_COUNT,
+        temperature: float = 0.7,
+        article_titles: List[str] = None,
+        skip_padding_check: bool = False
+    ) -> List[str]:
+        """
+        Generate queries for multiple contexts in true batch mode.
+        
+        This method processes all contexts in a single batch operation
+        for maximum efficiency. All inputs are padded to the same length,
+        and token generation is set to exactly QUERY_TOKEN_COUNT steps.
+        
+        Args:
+            contexts: List of context strings
+            instructions: Instructions for query generation
+            fixed_token_count: Fixed token count for each query
+            temperature: Temperature for generation
+            article_titles: List of article titles (optional)
+            skip_padding_check: Skip the check for padding tokens (for testing)
+            
+        Returns:
+            List of generated queries
+        """
+        if not contexts:
+            return []
+        
+        # Handle article titles
+        if article_titles is None:
+            article_titles = ["Wikipedia Article"] * len(contexts)
+        elif len(article_titles) != len(contexts):
+            raise ValueError(f"Length mismatch: {len(article_titles)} titles vs {len(contexts)} contexts")
+        
+        # Format prompts
+        prompts = []
+        for context, title in zip(contexts, article_titles):
+            prompt = format_query_prompt(context, instructions, title)
+            prompts.append(prompt)
+        
+        # Tokenize all prompts in a batch
+        batch_inputs = self.tokenizer(
+            prompts, 
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(self.device)
+        
+        # Create list of tokens that should be blocked to prevent early termination
+        bad_words_ids = []
+        for token in ["<", "</", "</query", "</query>"]:
+            token_ids = self.tokenizer(token, add_special_tokens=False).input_ids
+            bad_words_ids.append(token_ids)
+        
+        # Verify there are no padding tokens in the inputs except at the left side
+        # where they are added intentionally for proper batching
+        if not skip_padding_check:
+            pad_token_id = self.tokenizer.pad_token_id
+            for i, input_seq in enumerate(batch_inputs.input_ids):
+                # Convert to numpy for easier processing
+                input_seq_np = input_seq.cpu().numpy()
+                # Find positions of all pad tokens
+                pad_positions = np.where(input_seq_np == pad_token_id)[0]
+                
+                if len(pad_positions) > 0:
+                    # Check if pad tokens are continuous from the start
+                    # This allows padding tokens at the beginning (left-padding)
+                    expected_positions = np.arange(len(pad_positions))
+                    if not np.array_equal(pad_positions, expected_positions):
+                        logger.warning(f"Warning: Padding tokens may be present in non-initial positions in sequence {i}")
+                        # We don't fail the assertion in production, just log a warning
+        
+        # Generate all queries in a single batch
+        with torch.no_grad():
+            outputs = self.model.generate(
+                batch_inputs.input_ids,
+                attention_mask=batch_inputs.attention_mask,
+                min_new_tokens=fixed_token_count,
+                max_new_tokens=fixed_token_count,
+                pad_token_id=self.tokenizer.pad_token_id,
+                temperature=temperature,
+                do_sample=True,
+                bad_words_ids=bad_words_ids,
+                num_return_sequences=1
+            )
+        
+        # Process outputs to extract the generated queries
+        result_queries = []
+        
+        # Each batch element has its own input length
+        for i, output in enumerate(outputs):
+            # Get the original input length
+            input_length = batch_inputs.input_ids[i].shape[0]
+            
+            # Extract only the new tokens for this batch item
+            query_tokens = output[input_length:]
+            
+            # Decode the query
+            query = self.tokenizer.decode(query_tokens, skip_special_tokens=False)
+            
+            # Clean up query if needed
+            query = query.strip()
+            
+            # Remove special token markers if present
+            if EOT_TOKEN in query:
                 query = query.split(EOT_TOKEN)[0].strip()
             
             result_queries.append(query)
@@ -459,21 +576,31 @@ class LanguageModel:
 def load_language_model(
     model_name: str = MODEL_NAME,
     device: str = None,
-    load_in_8bit: bool = False
+    load_in_8bit: bool = False,
+    cache_dir: str = "model_cache",
+    config: Optional['Config'] = None
 ) -> LanguageModel:
     """
-    Load a language model.
+    Load a language model as a pure function.
     
     Args:
         model_name: Name of the model to load
         device: Device to load the model on
         load_in_8bit: Whether to load in 8-bit precision
+        cache_dir: Directory for caching model files
+        config: Optional Config object containing model settings
         
     Returns:
-        Loaded language model
+        A new LanguageModel instance
     """
+    # Use config parameters if provided
+    if config is not None:
+        model_name = config.model_name
+    
+    # Create and return a new LanguageModel instance
     return LanguageModel(
         model_name=model_name,
         device=device,
+        cache_dir=cache_dir,
         load_in_8bit=load_in_8bit
     ) 

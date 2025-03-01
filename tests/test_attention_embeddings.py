@@ -7,17 +7,17 @@ import pytest
 import numpy as np
 import torch
 from src.model import LanguageModel
-from src.embeddings import LlamaEmbeddingService
+from src.embeddings import (
+    get_embedding, 
+    compute_llama_embedding,
+    compute_attention_key_embedding,
+    compute_attention_query_embedding
+)
 
 @pytest.fixture(scope="module")
 def language_model():
     """Fixture to provide a language model for tests."""
     return LanguageModel("meta-llama/Llama-3.2-3B-Instruct", cache_dir="../model_cache")
-
-@pytest.fixture(scope="module")
-def embedding_service(language_model):
-    """Fixture to provide an embedding service for tests."""
-    return LlamaEmbeddingService(language_model)
 
 def test_language_model_structure(language_model):
     """Verify the structure of the language model."""
@@ -41,48 +41,48 @@ def test_language_model_structure(language_model):
     assert isinstance(first_layer.self_attn.k_proj.weight, torch.Tensor)
     assert isinstance(first_layer.self_attn.q_proj.weight, torch.Tensor)
 
-def test_standard_embedding(embedding_service):
+def test_standard_embedding(language_model):
     """Test standard embedding computation."""
     query_text = "What is artificial intelligence?"
     
-    standard_embedding = embedding_service.get_embedding(query_text)
+    standard_embedding = compute_llama_embedding(query_text, model=language_model)
     
     assert isinstance(standard_embedding, np.ndarray)
     assert standard_embedding.shape[0] > 0
     assert np.linalg.norm(standard_embedding) > 0
 
-def test_attention_key_embedding(embedding_service):
+def test_attention_key_embedding(language_model):
     """Test attention key embedding computation."""
     query_text = "What is artificial intelligence?"
     
-    key_embedding = embedding_service._compute_attention_key_embedding(query_text)
+    key_embedding = compute_attention_key_embedding(query_text, model=language_model)
     
     assert isinstance(key_embedding, np.ndarray)
     assert key_embedding.shape[0] > 0
     assert np.linalg.norm(key_embedding) > 0
 
-def test_attention_query_embedding(embedding_service):
+def test_attention_query_embedding(language_model):
     """Test attention query embedding computation."""
     query_text = "What is artificial intelligence?"
     
-    query_embedding = embedding_service._compute_attention_query_embedding(query_text)
+    query_embedding = compute_attention_query_embedding(query_text, model=language_model)
     
     assert isinstance(query_embedding, np.ndarray)
     assert query_embedding.shape[0] > 0
     assert np.linalg.norm(query_embedding) > 0
     
     # Test non-normalized version too
-    raw_query = embedding_service._compute_attention_query_embedding(query_text, normalize=False)
+    raw_query = compute_attention_query_embedding(query_text, model=language_model, normalize=False)
     assert isinstance(raw_query, np.ndarray)
     assert np.linalg.norm(raw_query) > 0
 
-def test_embedding_similarities(embedding_service):
+def test_embedding_similarities(language_model):
     """Test similarities between different embedding types."""
     query_text = "What is artificial intelligence?"
     
-    standard_embedding = embedding_service.get_embedding(query_text)
-    key_embedding = embedding_service._compute_attention_key_embedding(query_text)
-    query_embedding = embedding_service._compute_attention_query_embedding(query_text)
+    standard_embedding = compute_llama_embedding(query_text, model=language_model)
+    key_embedding = compute_attention_key_embedding(query_text, model=language_model)
+    query_embedding = compute_attention_query_embedding(query_text, model=language_model)
     
     # Check that embeddings have reasonable dimensions
     assert standard_embedding.shape[0] > 0

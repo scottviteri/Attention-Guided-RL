@@ -20,18 +20,128 @@ from src.config import (
     WARMUP_EPISODES,
     REWARD_SYSTEM_PROMPT
 )
-from src.embeddings import compute_embeddings
+from src.embeddings import (
+    compute_embeddings, 
+    tokenize_text, 
+    tokenize_text_batch, 
+    extract_attention_activations, 
+    extract_attention_activations_batch,
+    compute_attention_query_embedding,
+    compute_similarity,
+    normalize_embedding
+)
 from src.utils import (
     softmax,
     sample_from_distribution,
     compute_running_stats
 )
-from src.model import LanguageModel
+from src.model import LanguageModel, load_language_model
 from src.data import KeyValuePair
 from src.trajectory import Trajectory
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+def select_key(database: List[KeyValuePair], key_id: str, tokenizer=None) -> Tuple[str, str, List[KeyValuePair]]:
+    """
+    Select a key-value pair from a database by key_id without modifying the original database.
+    
+    Args:
+        database: List of KeyValuePair objects
+        key_id: ID of the key to select
+        tokenizer: Optional tokenizer to decode tokens
+        
+    Returns:
+        Tuple of (key, value, updated_database) where updated_database has the selected item removed
+    """
+    # Create a copy of the database to avoid modifying the original
+    updated_database = database.copy()
+    
+    # Find the key-value pair with the matching key_id
+    selected_pair = None
+    for i, pair in enumerate(updated_database):
+        if pair.key_id == key_id:
+            selected_pair = pair
+            updated_database.pop(i)
+            break
+    
+    if selected_pair is None:
+        raise ValueError(f"Key ID {key_id} not found in database")
+    
+    # Get key and value strings, decode tokens if available
+    key = selected_pair.key
+    value = selected_pair.value
+    
+    # If tokenizer is provided and tokens are available, decode them
+    if tokenizer:
+        if selected_pair.key_tokens is not None:
+            key = tokenizer.decode(selected_pair.key_tokens)
+        if selected_pair.value_tokens is not None:
+            value = tokenizer.decode(selected_pair.value_tokens)
+    
+    # Return the key, value, and updated database
+    return key, value, updated_database
+
+def select_value_with_attention(
+    query: str,
+    database: List[KeyValuePair],
+    model: LanguageModel,
+    temperature: float = 1.0,
+    verbose: bool = False
+) -> Tuple[str, str, List[KeyValuePair]]:
+    """
+    Select a key-value pair from the database using attention-based similarity.
+    
+    Args:
+        query: Query string to match against keys
+        database: List of KeyValuePair objects
+        model: Language model for computing embeddings
+        temperature: Temperature for softmax sampling (higher = more random)
+        verbose: Whether to print debug information
+        
+    Returns:
+        Tuple of (selected_key, selected_value, updated_database)
+    """
+    if not database:
+        return "", "", []
+    
+    # Compute query embedding
+    query_embedding = compute_attention_query_embedding(query, model)
+    
+    # Get all keys from the database
+    keys = [pair.key for pair in database]
+    key_ids = [pair.key_id for pair in database]
+    
+    # Compute key embeddings
+    key_embeddings = {}
+    for i, key in enumerate(keys):
+        key_embedding = compute_attention_query_embedding(key, model, normalize=True)
+        key_embeddings[key_ids[i]] = key_embedding
+    
+    # Compute similarities
+    similarities = compute_similarity(query_embedding, key_embeddings)
+    
+    # Convert to list for sampling
+    similarity_values = [similarities[key_id] for key_id in key_ids]
+    
+    # Apply temperature and softmax
+    probabilities = softmax(np.array(similarity_values) / temperature)
+    
+    # Sample based on probabilities
+    selected_idx = sample_from_distribution(probabilities)
+    selected_key_id = key_ids[selected_idx]
+    
+    if verbose:
+        # Print top 3 most similar keys
+        top_indices = np.argsort(similarity_values)[::-1][:3]
+        logger.info(f"Query: {query}")
+        logger.info(f"Top 3 similar keys:")
+        for idx in top_indices:
+            logger.info(f"  {keys[idx]}: {similarity_values[idx]:.4f} (prob: {probabilities[idx]:.4f})")
+        logger.info(f"Selected: {keys[selected_idx]}")
+    
+    # Select the key-value pair
+    return select_key(database, selected_key_id, model.tokenizer)
 
 class TrajectoryCollector:
     """
@@ -39,7 +149,7 @@ class TrajectoryCollector:
     """
     
     def __init__(
-        self, 
+        self,
         model: LanguageModel,
         database: List[KeyValuePair],
         temperature: float = 1.0
@@ -53,6 +163,7 @@ class TrajectoryCollector:
             temperature: Temperature for controlling exploration
         """
         self.model = model
+        self.device = model.device  # Store the device from the model
         self.database = database
         self.original_database = database.copy()  # Store a copy for reset
         self.temperature = temperature
@@ -63,235 +174,83 @@ class TrajectoryCollector:
             self.title = database[0].title
         
         logger.info(f"Initialized TrajectoryCollector with temperature: {temperature}")
-    
+        
     def collect_trajectory(self, batch_size: int = 1, verbose: bool = False) -> Trajectory:
         """
-        Collect trajectories by rolling out the policy.
+        Collect a trajectory by repeatedly generating a query, selecting a key-value pair,
+        and updating the context.
         
         Args:
-            batch_size: Number of parallel trajectories to collect
-            verbose: Whether to enable verbose logging
-        
+            batch_size: Number of trajectories to collect in parallel
+            verbose: Whether to print debug information
+            
         Returns:
-            Batched Trajectory object with steps
+            Trajectory object containing the collected steps
         """
-        # Initialize batched trajectory
-        trajectory = Trajectory(batch_size=batch_size, device=self.model.device)
+        if batch_size != 1:
+            raise NotImplementedError("Batch size > 1 not yet implemented for trajectory collection")
         
-        # Initialize contexts for each batch element
-        contexts = [""] * batch_size
-        article_titles = [self.title] * batch_size
+        trajectory = Trajectory()
+        context = ""
+        current_db = self.database.copy()
         
-        # Reset the database for each batch element
-        databases = [self.original_database.copy() for _ in range(batch_size)]
-        
-        # Track if each trajectory is finished
-        active_trajectories = [True] * batch_size
-        
-        # Continue until all trajectories are complete
-        step_count = 0
-        while any(active_trajectories):
-            step_count += 1
+        # Continue until we've used all key-value pairs or reached max turns
+        max_turns = len(self.database)
+        for turn in range(max_turns):
             if verbose:
-                logger.debug(f"Trajectory step {step_count}: Generating queries...")
+                logger.info(f"\nTurn {turn + 1}/{max_turns}")
+                logger.info(f"Context length: {len(context)}")
+                logger.info(f"Database size: {len(current_db)}")
             
-            # Generate queries based on current contexts (only for active trajectories)
-            active_indices = [i for i, active in enumerate(active_trajectories) if active]
-            active_contexts = [contexts[i] for i in active_indices]
-            active_titles = [article_titles[i] for i in active_indices]
+            # Generate query based on current context
+            query = self.model.generate_query(
+                context=context, 
+                temperature=self.temperature
+            )
             
-            if not active_indices:
+            if verbose:
+                logger.info(f"Generated query: {query}")
+            
+            # If database is empty, break
+            if not current_db:
                 break
+                
+            # Use attention-based value selection
+            selected_key, selected_value, current_db = select_value_with_attention(
+                query=query,
+                database=current_db,
+                model=self.model,
+                temperature=self.temperature,
+                verbose=verbose
+            )
             
-            # Generate queries for active trajectories
-            active_queries = []
-            for i, context in enumerate(active_contexts):
-                query = self.model.generate_query(
-                    context=context,
-                    fixed_token_count=QUERY_TOKEN_COUNT,
-                    temperature=self.temperature,
-                    article_title=active_titles[i]
-                )
-                active_queries.append(query)
-                
-                if verbose:
-                    logger.debug(f"Batch {active_indices[i]}, Generated query: {query}")
+            if verbose:
+                logger.info(f"Selected key: {selected_key}")
+                logger.info(f"Selected value: {selected_value}")
             
-            # Initialize step data with empty values
-            query_tokens_list = []
-            value_tokens_list = []
-            query_embeddings = []
-            key_ids = []
-            key_probs = []
-            raw_queries = [""] * batch_size
-            raw_values = [""] * batch_size
+            # Update context with the new query-value pair
+            if context:
+                # Add separator if needed
+                context += " "
+            context += f"Query: {query} Value: {selected_value}"
             
-            # Compute embeddings for active queries
-            active_query_embeddings = compute_embeddings(active_queries, are_queries=True)
+            # Add step to trajectory
+            trajectory.add_step(
+                query=query,
+                key=selected_key,
+                value=selected_value,
+                context=context
+            )
             
-            # For each active trajectory, compute similarities and select value
-            for batch_idx, global_idx in enumerate(active_indices):
-                query = active_queries[batch_idx]
-                query_embedding = active_query_embeddings[batch_idx]
-                
-                # Get available key embeddings for this batch element
-                available_key_embeddings = {}
-                for i, kv_pair in enumerate(databases[global_idx]):
-                    key_id = kv_pair.key_id if kv_pair.key_id else f"key_{i}"
-                    available_key_embeddings[key_id] = kv_pair.key_embedding
-                
-                # If no keys left, mark trajectory as complete
-                if not available_key_embeddings:
-                    active_trajectories[global_idx] = False
-                    continue
-                
-                # Compute similarities
-                similarities = {}
-                for key_id, key_embedding in available_key_embeddings.items():
-                    similarity = np.dot(query_embedding, key_embedding)
-                    similarities[key_id] = float(similarity)
-                
-                # Convert similarities to probabilities
-                similarity_values = np.array(list(similarities.values()))
-                probs = softmax(similarity_values, temperature=self.temperature)
-                
-                # Sample a key based on probabilities
-                selected_idx = sample_from_distribution(probs)
-                selected_key_id = list(similarities.keys())[selected_idx]
-                
-                if verbose:
-                    logger.debug(f"Batch {global_idx}, Selected key ID: {selected_key_id} (probability: {probs[selected_idx]:.4f})")
-                
-                # Get corresponding key-value pair
-                key, value = self._select_key(databases[global_idx], selected_key_id)
-                
-                if verbose:
-                    logger.debug(f"Batch {global_idx}, Retrieved value: {value[:50]}...")
-                
-                # Append to context for this batch element
-                if contexts[global_idx]:
-                    contexts[global_idx] += f" Query: {query} Value: {value} "
-                else:
-                    contexts[global_idx] = f"Query: {query} Value: {value} "
-                
-                # Tokenize query and value
-                query_tokens = self.model.tokenizer(
-                    query, 
-                    padding="max_length", 
-                    max_length=QUERY_TOKEN_COUNT,
-                    truncation=True,
-                    return_tensors="pt"
-                ).input_ids.squeeze(0)
-                
-                value_tokens = self.model.tokenizer(
-                    value, 
-                    padding="max_length", 
-                    max_length=VALUE_TOKEN_COUNT,
-                    truncation=True,
-                    return_tensors="pt"
-                ).input_ids.squeeze(0)
-                
-                # Add to batch lists
-                query_tokens_list.append(query_tokens.unsqueeze(0))
-                value_tokens_list.append(value_tokens.unsqueeze(0))
-                query_embeddings.append(query_embedding)
-                key_ids.append(selected_key_id)
-                
-                # Create key probabilities dictionary
-                key_probs_dict = {k: float(v) for k, v in zip(similarities.keys(), probs)}
-                key_probs.append(key_probs_dict)
-                
-                # Store raw strings
-                raw_queries[global_idx] = query
-                raw_values[global_idx] = value
-                
-                # Check if this batch element has completed its trajectory
-                if not databases[global_idx]:
-                    active_trajectories[global_idx] = False
-            
-            # If we have any active trajectories that selected values in this step
-            if query_tokens_list:
-                # Stack tensors for batch processing
-                query_tokens_batch = torch.cat(query_tokens_list, dim=0)
-                value_tokens_batch = torch.cat(value_tokens_list, dim=0)
-                query_embeddings_array = np.stack(query_embeddings)
-                
-                # For inactive trajectories, fill with zeros or empty values
-                for i in range(batch_size):
-                    if i not in active_indices or raw_queries[i] == "":
-                        # This batch element didn't get updated this step
-                        # Use zeros or empty values
-                        raw_queries[i] = "PADDING"
-                        raw_values[i] = "PADDING"
-                        if i not in active_indices:
-                            # This ensures we have the right shape for batching
-                            query_tokens_batch = torch.cat([
-                                query_tokens_batch, 
-                                torch.zeros(1, QUERY_TOKEN_COUNT, dtype=torch.long, device=self.model.device)
-                            ], dim=0)
-                            value_tokens_batch = torch.cat([
-                                value_tokens_batch, 
-                                torch.zeros(1, VALUE_TOKEN_COUNT, dtype=torch.long, device=self.model.device)
-                            ], dim=0)
-                            query_embeddings_array = np.concatenate([
-                                query_embeddings_array,
-                                np.zeros((1, query_embeddings_array.shape[1]))
-                            ], axis=0)
-                            key_ids.append("padding")
-                            key_probs.append({})
-                
-                # Add step to trajectory
-                trajectory.add_step(
-                    query_tokens=query_tokens_batch,
-                    value_tokens=value_tokens_batch,
-                    query_embeddings=query_embeddings_array,
-                    key_ids=key_ids,
-                    key_probs=key_probs,
-                    raw_queries=raw_queries,
-                    raw_values=raw_values
-                )
+            # If database is now empty, we're done
+            if not current_db:
+                break
         
         return trajectory
 
     def reset(self):
         """Reset the database to its original state."""
         self.database = self.original_database.copy()
-    
-    def _select_key(self, database: List[KeyValuePair], key_id: str) -> Tuple[str, str]:
-        """
-        Select a key-value pair from a database and remove it.
-        
-        Args:
-            database: List of KeyValuePair objects
-            key_id: ID of the key to select
-            
-        Returns:
-            Tuple of (key, value) strings
-        """
-        # Find the key-value pair with the given key_id
-        selected_idx = -1
-        for i, kv_pair in enumerate(database):
-            current_key_id = kv_pair.key_id if kv_pair.key_id else f"key_{i}"
-            if current_key_id == key_id:
-                selected_idx = i
-                break
-        
-        if selected_idx == -1:
-            raise ValueError(f"Key ID {key_id} not found in database")
-        
-        # Get the key-value pair
-        kv_pair = database.pop(selected_idx)
-        
-        # Convert token IDs to text using the tokenizer if available
-        if hasattr(self.model, 'tokenizer') and hasattr(kv_pair, 'key_tokens') and hasattr(kv_pair, 'value_tokens'):
-            key = self.model.tokenizer.decode(kv_pair.key_tokens)
-            value = self.model.tokenizer.decode(kv_pair.value_tokens)
-        else:
-            # Fallback if tokenizer is not available or tokens are not available
-            key = f"Key {key_id}"
-            value = f"Value for {key_id}"
-        
-        return key, value
 
 class ReinforcementLearner:
     """
@@ -653,7 +612,7 @@ def run_training(
     learning_rate: float = 0.0001,
     kl_weight: float = KL_WEIGHT,
     disable_checkpoints: bool = False,
-    verbose: bool = False
+    verbose: int = 0
 ) -> List[float]:
     """
     Run training for the reinforcement learning agent.
@@ -666,7 +625,7 @@ def run_training(
         learning_rate: Learning rate for optimizer
         kl_weight: Weight for KL divergence regularization
         disable_checkpoints: Whether to disable saving model checkpoints
-        verbose: Whether to enable verbose logging
+        verbose: Verbosity level (0=quiet, 1=normal, 2=debug, 3=trace)
         
     Returns:
         List of rewards for each episode
@@ -704,7 +663,10 @@ def run_training(
         if episode <= WARMUP_EPISODES:
             logger.info(f"Episode {episode}/{num_episodes} (warm-up)")
             # Collect trajectories but don't update policy
-            trajectory = collector.collect_trajectory(batch_size=batch_size, verbose=verbose)
+            trajectory = collector.collect_trajectory(
+                batch_size=batch_size, 
+                verbose=(verbose >= 3)  # Only show detailed trajectory logs at trace level
+            )
             rewards = learner.compute_trajectory_rewards(trajectory)
             episode_reward = np.mean(rewards)
             duration = time.time() - start_time
@@ -716,6 +678,7 @@ def run_training(
                 running_reward_stats["mean"] = episode_reward
                 running_reward_stats["std"] = 1.0
             else:
+                # Update moving average of rewards for filtering
                 running_reward_stats = compute_running_stats(
                     rewards=episode_rewards + [episode_reward], 
                     window_size=max(1, min(len(episode_rewards), 5))
@@ -732,7 +695,7 @@ def run_training(
             collector=collector,
             learner=learner,
             batch_size=batch_size,
-            verbose=verbose
+            verbose=(verbose >= 2)  # Show detailed logs at debug level or higher
         )
         
         # Extract reward
@@ -754,6 +717,15 @@ def run_training(
             f"Loss = {stats.get('loss', 0):.4f}, "
             f"Duration = {duration:.2f}s"
         )
+        
+        # Detailed logging at debug level or higher
+        if verbose >= 2:
+            logger.debug(
+                f"Episode {episode} details: Policy loss = {stats.get('policy_loss', 0):.4f}, "
+                f"KL loss = {stats.get('kl_loss', 0):.4f}, "
+                f"Gradient norm = {stats.get('grad_norm', 0):.4f}, "
+                f"Filtered ratio = {stats.get('filtered_ratio', 0):.2f}"
+            )
         
         # Track best model
         if episode_reward > best_reward and not disable_checkpoints:

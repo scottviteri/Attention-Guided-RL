@@ -44,10 +44,10 @@ class TestTrajectory:
     
     @pytest.fixture
     def batch_trajectory(self):
-        """Create a batched trajectory with two batch elements and one step."""
+        """Create a batched trajectory with two batch elements and two steps."""
         trajectory = Trajectory(batch_size=2)
         
-        # Add step for both batch elements
+        # Add first step for both batch elements
         trajectory.add_step(
             query_tokens=torch.tensor([
                 [1, 2, 3, 0, 0],
@@ -70,18 +70,41 @@ class TestTrajectory:
             raw_values=["First batch value", "Second batch value"]
         )
         
+        # Add second step for both batch elements
+        trajectory.add_step(
+            query_tokens=torch.tensor([
+                [13, 14, 15, 0, 0],
+                [16, 17, 18, 0, 0]
+            ]),
+            value_tokens=torch.tensor([
+                [19, 20, 21, 0, 0],
+                [22, 23, 24, 0, 0]
+            ]),
+            query_embeddings=np.array([
+                [0.7, 0.8, 0.9],
+                [0.1, 0.2, 0.3]
+            ]),
+            key_ids=["key_3", "key_4"],
+            key_probs=[
+                {"key_3": 0.6, "key_4": 0.4},
+                {"key_3": 0.2, "key_4": 0.8}
+            ],
+            raw_queries=["Third batch query", "Fourth batch query"],
+            raw_values=["Third batch value", "Fourth batch value"]
+        )
+        
         return trajectory
     
     def test_initialization(self):
         """Test initializing a trajectory."""
         # Empty trajectory
         trajectory = Trajectory()
-        assert trajectory.batch_size == 1
+        assert trajectory.get_batch_size() == 1
         assert trajectory.length == 0
         
         # With specified batch size
         trajectory = Trajectory(batch_size=3)
-        assert trajectory.batch_size == 3
+        assert trajectory.get_batch_size() == 3
         assert trajectory.length == 0
     
     def test_add_step(self, simple_trajectory):
@@ -123,15 +146,25 @@ class TestTrajectory:
         token_tensor = batch_trajectory.get_token_tensor()
         
         # Expected shape: [batch_size, steps * (query_tokens + value_tokens)]
-        # In this case: [2, 10] because 1 step * (5 query tokens + 5 value tokens)
-        assert token_tensor.shape == (2, 10)
+        # In this case: [2, 20] because 2 steps * (5 query tokens + 5 value tokens)
+        assert token_tensor.shape == (2, 20)
         
-        # Check tokens for each batch element
-        expected_tokens = torch.tensor([
-            [1, 2, 3, 0, 0, 7, 8, 9, 0, 0],
-            [4, 5, 6, 0, 0, 10, 11, 12, 0, 0]
-        ])
-        assert torch.equal(token_tensor, expected_tokens)
+        # Check content of the tensor
+        # First batch element, first step
+        assert token_tensor[0, 0:5].tolist() == [1, 2, 3, 0, 0]  # First query
+        assert token_tensor[0, 5:10].tolist() == [7, 8, 9, 0, 0]  # First value
+        
+        # First batch element, second step
+        assert token_tensor[0, 10:15].tolist() == [13, 14, 15, 0, 0]  # Second query
+        assert token_tensor[0, 15:20].tolist() == [19, 20, 21, 0, 0]  # Second value
+        
+        # Second batch element, first step
+        assert token_tensor[1, 0:5].tolist() == [4, 5, 6, 0, 0]  # First query
+        assert token_tensor[1, 5:10].tolist() == [10, 11, 12, 0, 0]  # First value
+        
+        # Second batch element, second step
+        assert token_tensor[1, 10:15].tolist() == [16, 17, 18, 0, 0]  # Second query
+        assert token_tensor[1, 15:20].tolist() == [22, 23, 24, 0, 0]  # Second value
     
     def test_get_query_contexts(self, simple_trajectory):
         """Test formatting a trajectory for query generation."""
@@ -169,9 +202,11 @@ class TestTrajectory:
         
         # Check content of both reward contexts
         query_value_1 = f" <query> First batch query </query> {EOT_TOKEN} <value> First batch value </value> {EOT_TOKEN} "
+        query_value_1 += f" <query> Third batch query </query> {EOT_TOKEN} <value> Third batch value </value> {EOT_TOKEN} "
         expected_1 = f"{SYSTEM_START} {system_prompt} {EOT_TOKEN} {USER_START} {query_value_1} {EOT_TOKEN}"
         
         query_value_2 = f" <query> Second batch query </query> {EOT_TOKEN} <value> Second batch value </value> {EOT_TOKEN} "
+        query_value_2 += f" <query> Fourth batch query </query> {EOT_TOKEN} <value> Fourth batch value </value> {EOT_TOKEN} "
         expected_2 = f"{SYSTEM_START} {system_prompt} {EOT_TOKEN} {USER_START} {query_value_2} {EOT_TOKEN}"
         
         assert contexts[0] == expected_1
@@ -202,18 +237,36 @@ class TestTrajectory:
         
         # Should return a list of dictionary lists, one per batch element
         assert len(dict_lists) == 2
-        assert len(dict_lists[0]) == 1  # One step per batch element
-        assert len(dict_lists[1]) == 1
+        assert len(dict_lists[0]) == 2  # Two steps per batch element
+        assert len(dict_lists[1]) == 2
         
-        # Check first batch element
+        # Check content of the first batch element's first step
         assert dict_lists[0][0]["query"] == "First batch query"
-        assert dict_lists[0][0]["value"] == "First batch value"
         assert dict_lists[0][0]["key_id"] == "key_1"
+        assert dict_lists[0][0]["value"] == "First batch value"
+        assert dict_lists[0][0]["probs"] == {"key_1": 0.8, "key_2": 0.2}
+        assert np.array_equal(dict_lists[0][0]["query_embedding"], np.array([0.1, 0.2, 0.3]))
         
-        # Check second batch element
+        # Check content of the second batch element's first step
         assert dict_lists[1][0]["query"] == "Second batch query"
-        assert dict_lists[1][0]["value"] == "Second batch value"
         assert dict_lists[1][0]["key_id"] == "key_2"
+        assert dict_lists[1][0]["value"] == "Second batch value"
+        assert dict_lists[1][0]["probs"] == {"key_1": 0.3, "key_2": 0.7}
+        assert np.array_equal(dict_lists[1][0]["query_embedding"], np.array([0.4, 0.5, 0.6]))
+        
+        # Check content of the first batch element's second step
+        assert dict_lists[0][1]["query"] == "Third batch query"
+        assert dict_lists[0][1]["key_id"] == "key_3"
+        assert dict_lists[0][1]["value"] == "Third batch value"
+        assert dict_lists[0][1]["probs"] == {"key_3": 0.6, "key_4": 0.4}
+        assert np.array_equal(dict_lists[0][1]["query_embedding"], np.array([0.7, 0.8, 0.9]))
+        
+        # Check content of the second batch element's second step
+        assert dict_lists[1][1]["query"] == "Fourth batch query"
+        assert dict_lists[1][1]["key_id"] == "key_4"
+        assert dict_lists[1][1]["value"] == "Fourth batch value"
+        assert dict_lists[1][1]["probs"] == {"key_3": 0.2, "key_4": 0.8}
+        assert np.array_equal(dict_lists[1][1]["query_embedding"], np.array([0.1, 0.2, 0.3]))
     
     def test_from_dict_lists(self):
         """Test creating a Trajectory from lists of dictionaries."""
@@ -264,8 +317,9 @@ class TestTrajectory:
     
     def test_length_and_batch_size(self, simple_trajectory, batch_trajectory):
         """Test the length and batch_size methods."""
+        # Test length
         assert len(simple_trajectory) == 2
         assert simple_trajectory.get_batch_size() == 1
         
-        assert len(batch_trajectory) == 1
+        assert len(batch_trajectory) == 2
         assert batch_trajectory.get_batch_size() == 2 

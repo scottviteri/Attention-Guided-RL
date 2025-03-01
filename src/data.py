@@ -1,9 +1,6 @@
 """
 Functions for loading and processing Wikipedia articles and key-value pairs.
 """
-
-import os
-import json
 import requests
 import logging
 import numpy as np
@@ -12,6 +9,7 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 import torch
 from dataclasses import dataclass, field
+import random
 
 from src.config import (
     WIKI_ARTICLE_TITLE, 
@@ -34,11 +32,15 @@ class KeyValuePair:
         value_tokens: Tokenized value content as a PyTorch tensor
         key_embedding: Embedding vector for the key
         key_id: Optional identifier for the key
+        key: The key string (optional)
+        value: The value string (optional)
     """
     key_tokens: torch.Tensor
     value_tokens: torch.Tensor
     key_embedding: np.ndarray
     key_id: str = ""
+    key: str = ""
+    value: str = ""
 
 @dataclass(frozen=True)
 class WikiArticle:
@@ -214,8 +216,6 @@ def create_key_value_pairs_from_chunks(
     # Create pairs
     if random_selection:
         # Select random CONSECUTIVE pairs from the article
-        import random
-        
         # First determine all possible consecutive pairs based on non_overlapping setting
         possible_pairs = []
         if non_overlapping:
@@ -265,6 +265,7 @@ def process_article(
     title: str,
     article_text: str,
     tokenizer,
+    model,
     chunk_size: int,
     min_chunks_per_article: int = 10
 ) -> List[KeyValuePair]:
@@ -275,6 +276,7 @@ def process_article(
         title: Article title
         article_text: Text content of the article
         tokenizer: Tokenizer to use for processing
+        model: Language model for computing embeddings (required)
         chunk_size: Size of each chunk in tokens
         min_chunks_per_article: Minimum number of chunks required for the article
         
@@ -313,7 +315,7 @@ def process_article(
             return []
             
         # Get embeddings for all keys at once
-        key_embeddings = compute_embeddings(key_texts, are_queries=False)
+        key_embeddings = compute_embeddings(key_texts, model=model, are_queries=False)
         
         # Create KeyValuePair objects
         result_pairs = []
@@ -325,7 +327,9 @@ def process_article(
                 key_id=key_id,
                 key_tokens=key_tokens,
                 value_tokens=value_tokens,
-                key_embedding=key_embeddings[idx]
+                key_embedding=key_embeddings[idx],
+                key=key_texts[idx],
+                value=tokenizer.decode(value_tokens)
             )
             result_pairs.append(pair)
         
@@ -395,6 +399,7 @@ def process_articles(
 def process_article_text(
     article_text: str,
     tokenizer,
+    model,
     title: str = "Wikipedia Article",
     max_pairs: int = MAX_PAIRS,
     should_compute_embeddings: bool = True
@@ -405,6 +410,7 @@ def process_article_text(
     Args:
         article_text: Text of the article
         tokenizer: Tokenizer to use
+        model: Language model for computing embeddings (required)
         title: Title of the article
         max_pairs: Maximum number of key-value pairs to create
         should_compute_embeddings: Whether to compute key embeddings
@@ -458,7 +464,7 @@ def process_article_text(
     key_embeddings = {}
     if should_compute_embeddings and key_texts:
         logger.info(f"Computing embeddings for {len(key_texts)} keys")
-        embeddings = compute_embeddings(key_texts, are_queries=False)
+        embeddings = compute_embeddings(key_texts, model=model, are_queries=False)
         
         for i, embedding in enumerate(embeddings):
             key_embeddings[f"key_{i}"] = embedding
@@ -474,17 +480,21 @@ def process_article_text(
     return result
 
 def process_next_article(
-    wiki_iterator: Iterator[Dict[str, Any]],
+    wiki_iterator: 'WikipediaIterator',
+    model,  # Required parameter
+    max_pairs: int = MAX_PAIRS,
     tokenizer_name: str = MODEL_NAME,
-    max_pairs: int = MAX_PAIRS
+    device: str = None
 ) -> Dict[str, Any]:
     """
-    Process the next article from the Wikipedia dataset.
+    Process the next article from a Wikipedia iterator.
     
     Args:
-        wiki_iterator: Iterator over Wikipedia articles
-        tokenizer_name: Name of the tokenizer model to use
+        wiki_iterator: Iterator for Wikipedia articles
+        model: Language model to use for embeddings (required)
         max_pairs: Maximum number of key-value pairs
+        tokenizer_name: Name of the tokenizer model to use
+        device: Device to load the model on (cpu or cuda)
         
     Returns:
         Processed article data
@@ -504,7 +514,14 @@ def process_next_article(
         }
     
     # Process the article
-    data = process_article_text(text, tokenizer, title, max_pairs, should_compute_embeddings=True)
+    data = process_article_text(
+        article_text=text, 
+        tokenizer=tokenizer, 
+        model=model,
+        title=title, 
+        max_pairs=max_pairs, 
+        should_compute_embeddings=True
+    )
     data["title"] = title  # Use the actual title
     
     return data
@@ -512,7 +529,8 @@ def process_next_article(
 def load_wikipedia_article(
     title: str = WIKI_ARTICLE_TITLE,
     max_pairs: int = MAX_PAIRS,
-    tokenizer_name: str = MODEL_NAME
+    tokenizer_name: str = MODEL_NAME,
+    device: str = None
 ) -> List[KeyValuePair]:
     """
     Load a Wikipedia article and convert it to a list of KeyValuePair objects.
@@ -521,12 +539,17 @@ def load_wikipedia_article(
         title: Title of the Wikipedia article
         max_pairs: Maximum number of key-value pairs
         tokenizer_name: Name of the tokenizer model to use
+        device: Device to load the model on (cpu or cuda)
         
     Returns:
         List of KeyValuePair objects
     """
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    
+    # Load language model
+    from src.model import load_language_model
+    model = load_language_model(device=device)
     
     # Try to fetch from Wikipedia API first as it's more direct for a known title
     logger.info(f"Fetching article with title: {title}")
@@ -538,6 +561,7 @@ def load_wikipedia_article(
             title=title,
             article_text=article_text,
             tokenizer=tokenizer,
+            model=model,
             chunk_size=KEY_TOKEN_COUNT,
             min_chunks_per_article=max_pairs // 2  # Need half as many chunks as max_pairs for non-overlapping pairs
         )
@@ -563,6 +587,7 @@ def load_wikipedia_article(
                     title=current_title,
                     article_text=current_text,
                     tokenizer=tokenizer,
+                    model=model,
                     chunk_size=KEY_TOKEN_COUNT,
                     min_chunks_per_article=max_pairs // 2
                 )
@@ -579,22 +604,26 @@ def load_wikipedia_article(
 
 def load_random_wikipedia_article(
     max_pairs: int = MAX_PAIRS,
-    tokenizer_name: str = MODEL_NAME
+    tokenizer_name: str = MODEL_NAME,
+    device: str = None
 ) -> List[KeyValuePair]:
     """
     Load a random Wikipedia article and convert it to a list of KeyValuePair objects.
     
-    This function will automatically skip articles that are too short to process.
-    
     Args:
         max_pairs: Maximum number of key-value pairs
         tokenizer_name: Name of the tokenizer model to use
+        device: Device to load the model on (cpu or cuda)
         
     Returns:
         List of KeyValuePair objects
     """
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    
+    # Load language model
+    from src.model import load_language_model
+    model = load_language_model(device=device)
     
     # Create iterator
     wiki_iterator = create_wiki_dataset_iterator()
@@ -612,6 +641,7 @@ def load_random_wikipedia_article(
                 title=title,
                 article_text=article_text,
                 tokenizer=tokenizer,
+                model=model,
                 chunk_size=KEY_TOKEN_COUNT,
                 min_chunks_per_article=max_pairs // 2
             )
@@ -656,6 +686,10 @@ def process_articles_stream(
     """
     logger.info(f"Processing Wikipedia articles stream with chunk_size={chunk_size}")
     
+    # Load language model
+    from src.model import load_language_model
+    model = load_language_model(device=None)  # Use default device
+    
     while True:
         try:
             # Get next article
@@ -670,6 +704,7 @@ def process_articles_stream(
                 title=title,
                 article_text=article_text,
                 tokenizer=tokenizer,
+                model=model,
                 chunk_size=chunk_size,
                 min_chunks_per_article=min_chunks_per_article
             )
@@ -688,16 +723,17 @@ def process_articles_stream(
                 logger.error(f"Error processing articles: {e}")
             break
 
-def create_embedding(text: str) -> np.ndarray:
+def create_embedding(text: str, model) -> np.ndarray:
     """
     Create an embedding vector for the given text.
     
     Args:
         text: The text to create an embedding for
+        model: Language model for computing embeddings (required)
         
     Returns:
         Numpy array containing the embedding vector
     """
     # Compute embedding for single text
-    embeddings = compute_embeddings([text], are_queries=False)
+    embeddings = compute_embeddings([text], model=model, are_queries=False)
     return embeddings[0] 

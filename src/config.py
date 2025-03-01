@@ -3,13 +3,14 @@ Configuration parameters for the Attention-Guided RL project.
 """
 
 import os
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Any
 
 # API keys
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 # Model parameters
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
-EMBEDDING_MODEL = "text-embedding-ada-002"
 
 # Training parameters
 LEARNING_RATE = 1e-5
@@ -55,4 +56,56 @@ WANDB_ENTITY = None  # W&B entity name
 # Paths
 DATA_DIR = "data"
 CHECKPOINT_DIR = "checkpoints"
-LOGS_DIR = "logs" 
+LOGS_DIR = "logs"
+
+@dataclass(frozen=True)
+class Config:
+    """
+    A frozen dataclass representing all configuration settings for the project.
+    
+    This provides a single place to access all configuration and ensures immutability.
+    """
+    # Model parameters
+    model_name: str = MODEL_NAME 
+    # Training parameters
+    learning_rate: float = LEARNING_RATE
+    kl_weight: float = KL_WEIGHT
+    num_episodes: int = NUM_EPISODES
+    warmup_episodes: int = WARMUP_EPISODES
+    batch_size: int = BATCH_SIZE
+    
+    # Token parameters
+    query_token_count: int = QUERY_TOKEN_COUNT
+    key_token_count: int = KEY_TOKEN_COUNT
+    value_token_count: int = VALUE_TOKEN_COUNT
+    
+    # Wikipedia article parameters
+    wiki_article_title: str = WIKI_ARTICLE_TITLE
+    max_pairs: int = MAX_PAIRS
+    
+    # Special tokens
+    user_start: str = USER_START
+    system_start: str = SYSTEM_START
+    assistant_start: str = ASSISTANT_START
+    eot_token: str = EOT_TOKEN
+    
+    # Instructions
+    query_instructions: str = QUERY_INSTRUCTIONS
+    reward_system_prompt: str = REWARD_SYSTEM_PROMPT
+    
+    # Logging parameters
+    log_interval: int = LOG_INTERVAL
+    save_model_interval: int = SAVE_MODEL_INTERVAL
+    wandb_project: str = WANDB_PROJECT
+    wandb_entity: Optional[str] = WANDB_ENTITY
+    
+    # Paths
+    data_dir: str = DATA_DIR
+    checkpoint_dir: str = CHECKPOINT_DIR
+    logs_dir: str = LOGS_DIR
+    
+    # API keys
+    openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
+
+# Create a default config instance
+DEFAULT_CONFIG = Config() 

@@ -14,10 +14,12 @@ from src.rl_agent import (
     TrajectoryCollector,
     ReinforcementLearner,
     train_episode,
-    run_training
+    run_training,
+    select_key
 )
 from src.trajectory import Trajectory
-from src.config import QUERY_TOKEN_COUNT, VALUE_TOKEN_COUNT
+from src.config import QUERY_TOKEN_COUNT, VALUE_TOKEN_COUNT, Config
+from src.data import KeyValuePair
 
 # Try to import bitsandbytes, but don't fail if it's not available
 try:
@@ -26,6 +28,90 @@ try:
 except ImportError:
     HAS_BITSANDBYTES = False
 
+
+@pytest.fixture
+def mock_model():
+    """Fixture for a mock model."""
+    mock = MagicMock()
+    mock.generate_query.return_value = "What is artificial intelligence?"
+    mock.device = "cpu"
+    mock.tokenizer.return_value.input_ids = torch.zeros((1, QUERY_TOKEN_COUNT), dtype=torch.long)
+    return mock
+
+@pytest.fixture
+def mock_database():
+    """Fixture for a mock database of key-value pairs."""
+    return [
+        KeyValuePair(
+            key_tokens=torch.tensor([1, 2, 3]),
+            value_tokens=torch.tensor([4, 5, 6]),
+            key_embedding=np.array([0.1, 0.2, 0.3]),
+            key_id="key_0",
+            key="Key 0",
+            value="Value 0"
+        ),
+        KeyValuePair(
+            key_tokens=torch.tensor([7, 8, 9]),
+            value_tokens=torch.tensor([10, 11, 12]),
+            key_embedding=np.array([0.4, 0.5, 0.6]),
+            key_id="key_1",
+            key="Key 1", 
+            value="Value 1"
+        )
+    ]
+
+def test_select_key(mock_database):
+    """Test the select_key pure function."""
+    # Test selecting a key
+    key, value, updated_db = select_key(mock_database, "key_0")
+    
+    # Check that the key was removed from the database
+    assert len(updated_db) == 1
+    assert updated_db[0].key_id == "key_1"
+    
+    # Check that the original database is unchanged
+    assert len(mock_database) == 2
+    
+    # Check the returned key and value
+    assert key == "Key 0"
+    assert value == "Value 0"
+    
+    # Test with tokenizer
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.decode = lambda x: "Decoded " + str(x.tolist())
+    
+    # Create a database with empty key/value strings to test tokenizer decoding
+    test_db = [
+        KeyValuePair(
+            key_tokens=torch.tensor([7, 8, 9]),
+            value_tokens=torch.tensor([10, 11, 12]),
+            key_embedding=np.array([0.4, 0.5, 0.6]),
+            key_id="key_1",
+            key="",  # Empty key to force tokenizer decoding
+            value=""  # Empty value to force tokenizer decoding
+        )
+    ]
+    
+    key, value, updated_db = select_key(test_db, "key_1", mock_tokenizer)
+    
+    # Check the decoded values
+    assert key == "Decoded [7, 8, 9]"
+    assert value == "Decoded [10, 11, 12]"
+    
+    # Test with invalid key_id
+    with pytest.raises(ValueError):
+        select_key(mock_database, "nonexistent_key")
+
+def test_config():
+    """Test that the Config dataclass is immutable."""
+    config = Config()
+    
+    # Test that we can read values
+    assert config.model_name == "meta-llama/Llama-3.2-3B-Instruct"
+    
+    # Test that the class is frozen
+    with pytest.raises(Exception):
+        config.model_name = "new-model-name"
 
 class TestTrajectoryCollector:
     """Test cases for TrajectoryCollector."""
@@ -57,17 +143,11 @@ class TestTrajectoryCollector:
         
         return [kv1, kv2]
     
-    @patch("src.rl_agent.compute_embeddings")
-    @patch("src.rl_agent.softmax")
-    @patch("src.rl_agent.sample_from_distribution")
-    def test_collect_trajectory(self, mock_sample, mock_softmax, mock_compute, mock_model, mock_database):
-        """Test collecting a trajectory with the new implementation."""
-        # Mock embedding computation
-        mock_compute.return_value = np.array([[0.1, 0.2, 0.3]])
-    
-        # Mock softmax and sampling
-        mock_softmax.return_value = np.array([0.7, 0.3])
-        mock_sample.return_value = 0
+    @patch("src.rl_agent.select_value_with_attention")
+    def test_collect_trajectory(self, mock_select_value, mock_model, mock_database):
+        """Test collecting a trajectory with the new attention-based implementation."""
+        # Mock the select_value_with_attention function
+        mock_select_value.return_value = ("Mock Key", "Mock Value", [])
     
         # Create collector
         collector = TrajectoryCollector(
@@ -76,35 +156,18 @@ class TestTrajectoryCollector:
             temperature=0.8
         )
     
-        # Mock the _select_key method to return empty database after selection
-        # This will cause the trajectory to complete after one step
-        original_select_key = collector._select_key
+        # Collect trajectory
+        trajectory = collector.collect_trajectory(batch_size=1)
         
-        def mock_select_key(database, key_id):
-            result = original_select_key(database, key_id)
-            # Empty the database to simulate completing the trajectory
-            database.clear()
-            return result
-        
-        collector._select_key = mock_select_key
-    
-        # Mock the tokenizer to return tensors
-        query_tokens = torch.zeros((1, QUERY_TOKEN_COUNT), dtype=torch.long)
-        value_tokens = torch.zeros((1, VALUE_TOKEN_COUNT), dtype=torch.long)
-        mock_model.tokenizer.side_effect = None
-        mock_model.tokenizer.return_value.input_ids = query_tokens
-    
-        # Patch torch.cat to avoid tensor issues
-        with patch("torch.cat", return_value=torch.zeros((1, QUERY_TOKEN_COUNT), dtype=torch.long)):
-            # Collect trajectory
-            trajectory = collector.collect_trajectory(batch_size=1)
-            
-            # Verify
-            assert isinstance(trajectory, Trajectory)
-            assert trajectory.length > 0
-            mock_compute.assert_called()
-            mock_softmax.assert_called()
-            mock_sample.assert_called()
+        # Verify
+        assert isinstance(trajectory, Trajectory)
+        assert trajectory.length > 0
+        assert len(trajectory.steps) > 0
+        assert trajectory.steps[0]['query'] is not None
+        assert trajectory.steps[0]['key'] == "Mock Key"
+        assert trajectory.steps[0]['value'] == "Mock Value"
+        assert trajectory.steps[0]['context'] is not None
+        mock_select_value.assert_called()
 
 
 class TestReinforcementLearner:
