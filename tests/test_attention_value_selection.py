@@ -20,9 +20,10 @@ from src.embeddings import (
 from src.rl_agent import select_value_with_attention
 
 @pytest.fixture(scope="module")
-def language_model():
+def language_model(language_model_cpu):
     """Fixture to provide a language model for tests."""
-    return LanguageModel("meta-llama/Llama-3.2-3B-Instruct", cache_dir="../model_cache", device="cpu")
+    # Use the shared session fixture from conftest.py
+    return language_model_cpu
 
 @pytest.fixture
 def mock_database():

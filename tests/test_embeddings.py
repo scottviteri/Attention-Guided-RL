@@ -19,9 +19,10 @@ from src.embeddings import (
 from src.model import LanguageModel
 
 @pytest.fixture(scope="module")
-def language_model():
+def language_model(language_model_cpu):
     """Fixture to provide a language model for tests."""
-    return LanguageModel(cache_dir="../model_cache", device="cpu")
+    # Use the shared session fixture from conftest.py
+    return language_model_cpu
 
 @patch('src.embeddings.get_embeddings')
 def test_compute_embeddings(mock_get_embeddings, language_model):

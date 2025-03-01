@@ -15,9 +15,10 @@ from src.embeddings import (
 )
 
 @pytest.fixture(scope="module")
-def language_model():
+def language_model(language_model_cpu):
     """Fixture to provide a language model for tests."""
-    return LanguageModel("meta-llama/Llama-3.2-3B-Instruct", cache_dir="../model_cache")
+    # Use the shared session fixture from conftest.py
+    return language_model_cpu
 
 def test_language_model_structure(language_model):
     """Verify the structure of the language model."""

@@ -12,9 +12,10 @@ from src.model import LanguageModel
 from src.embeddings import compute_embeddings, get_embeddings, get_embedding
 
 @pytest.fixture(scope="module")
-def language_model():
+def language_model(language_model_cpu):
     """Fixture to provide a language model for tests."""
-    return LanguageModel(cache_dir="../model_cache", device="cpu")
+    # Use the shared session fixture from conftest.py
+    return language_model_cpu
 
 def test_get_embedding(language_model):
     """Test getting a single embedding."""

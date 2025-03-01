@@ -12,9 +12,10 @@ from src.model import LanguageModel, MODEL_NAME
 from src.config import QUERY_TOKEN_COUNT
 
 @pytest.fixture
-def language_model():
+def language_model(language_model_cuda):
     """Initialize a language model for testing."""
-    return LanguageModel(device="cuda" if torch.cuda.is_available() else "cpu")
+    # Use the shared session fixture from conftest.py
+    return language_model_cuda
 
 @pytest.mark.parametrize(
     "batch_size", [1, 2, 3]

@@ -7,11 +7,10 @@ import torch
 from src.model import LanguageModel
 
 @pytest.fixture(scope="module")
-def language_model():
+def language_model(language_model_cpu):
     """Fixture to provide a language model for tests."""
-    return LanguageModel(model_name="meta-llama/Llama-3.2-3B-Instruct", 
-                          cache_dir="../model_cache", 
-                          device="cpu")
+    # Use the shared session fixture from conftest.py
+    return language_model_cpu
 
 def test_model_basic_structure(language_model):
     """Test the basic structure of the model."""
