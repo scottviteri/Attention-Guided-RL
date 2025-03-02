@@ -19,13 +19,12 @@ from datetime import datetime
 
 from src.config import (
     MODEL_NAME,
-    MAX_PAIRS,
     KL_WEIGHT,
     NUM_EPISODES,
     BATCH_SIZE,
     LEARNING_RATE
 )
-from src.data import load_wikipedia_article, load_random_wikipedia_article
+from src.data import get_wikipedia_kv_stream
 from src.model import load_language_model
 from src.utils import ensure_dir, plot_rewards
 from src.rl_agent import run_training
@@ -43,12 +42,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train a reinforcement learning agent on Wikipedia articles")
     
     # Data arguments
-    parser.add_argument("--title", type=str, default=None,
-                        help="Title of the Wikipedia article to use (providing this will use a specific article instead of a random one and automatically set num_episodes=1 and batch_size=1)")
     parser.add_argument("--random-article", action="store_true", 
                         help="Use a random Wikipedia article (default behavior)")
-    parser.add_argument("--max-pairs", type=int, default=MAX_PAIRS,
-                        help="Maximum number of key-value pairs to extract")
     
     # Model arguments
     parser.add_argument("--device", type=str, choices=["cuda", "cpu"], default=None,
@@ -142,8 +137,6 @@ def setup_wandb(args, disable_wandb: bool = False) -> Optional[Dict[str, Any]]:
     # Set up wandb
     logger.info("Setting up wandb logging")
     config = {
-        "title": args.title,
-        "max_pairs": args.max_pairs,
         "num_episodes": args.num_episodes,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
@@ -165,15 +158,6 @@ def main():
     # Parse arguments
     args = parse_args()
     
-    # If title is provided, automatically set episodes and batch size to 1 for quick testing
-    if args.title:
-        if args.num_episodes != 1:
-            logger.info(f"Title provided, setting num_episodes from {args.num_episodes} to 1")
-            args.num_episodes = 1
-        if args.batch_size != 1:
-            logger.info(f"Title provided, setting batch_size from {args.batch_size} to 1")
-            args.batch_size = 1
-    
     # Configure logging based on verbosity level
     setup_logging(args)
     
@@ -188,22 +172,13 @@ def main():
     else:
         logger.info(f"Using device: {model.device} (auto-detected)")
     
-    # Load the Wikipedia article
+    # Load Wikipedia articles
     logger.info("Loading Wikipedia article")
-    if args.title:
-        database = load_wikipedia_article(
-            title=args.title,
-            max_pairs=args.max_pairs,
-            device=args.device
-        )
-        logger.info(f"Loaded article: {args.title} with {len(database)} key-value pairs")
-    else:
-        # Default behavior: use random article
-        database = load_random_wikipedia_article(
-            max_pairs=args.max_pairs,
-            device=args.device
-        )
-        logger.info(f"Loaded random article with {len(database)} key-value pairs")
+    stream = get_wikipedia_kv_stream(device=args.device)
+    
+    # Get the first article from the stream
+    database = next(stream)
+    logger.info(f"Loaded article with {len(database)} key-value pairs")
     
     # Run training
     logger.info("Starting training")

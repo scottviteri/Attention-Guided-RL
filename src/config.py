@@ -27,6 +27,10 @@ VALUE_TOKEN_COUNT = 40  # Fixed token count for values
 # Wikipedia article parameters
 WIKI_ARTICLE_TITLE = "Artificial intelligence"  # Default article to use
 MAX_PAIRS = 10  # Maximum number of key-value pairs to extract
+MIN_ARTICLE_TOKENS = 200  # Minimum tokens required in an article to process it
+CHUNK_SIZE = 24  # Size of each chunk in tokens
+STRIDE = 12  # Stride for overlapping chunks
+MAX_CHUNKS = 50  # Maximum number of chunks to create from article
 
 # Special tokens
 USER_START = "<|start_header_id|>user<|end_header_id|>"
@@ -82,6 +86,10 @@ class Config:
     # Wikipedia article parameters
     wiki_article_title: str = WIKI_ARTICLE_TITLE
     max_pairs: int = MAX_PAIRS
+    min_article_tokens: int = MIN_ARTICLE_TOKENS
+    chunk_size: int = CHUNK_SIZE
+    stride: int = STRIDE
+    max_chunks: int = MAX_CHUNKS
     
     # Special tokens
     user_start: str = USER_START

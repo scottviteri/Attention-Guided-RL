@@ -8,6 +8,7 @@ import numpy as np
 from unittest.mock import patch, MagicMock, ANY
 import dataclasses
 import bitsandbytes as bnb
+import os
 
 # Import the module to test
 from src.rl_agent import (
@@ -114,7 +115,7 @@ def test_config():
         config.model_name = "new-model-name"
 
 class TestTrajectoryCollector:
-    """Test cases for TrajectoryCollector."""
+    """Test cases for the TrajectoryCollector class."""
     
     @pytest.fixture
     def mock_model(self):
@@ -157,7 +158,7 @@ class TestTrajectoryCollector:
         )
     
         # Collect trajectory
-        trajectory = collector.collect_trajectory(batch_size=1)
+        trajectory = collector.collect_trajectory(query="Test query")
         
         # Verify
         assert isinstance(trajectory, Trajectory)
@@ -317,7 +318,8 @@ class TestReinforcementLearner:
 
 
 @patch("src.rl_agent.TrajectoryCollector")
-def test_train_episode(mock_trajectory_collector_class):
+@patch("src.rl_agent.REWARD_SYSTEM_PROMPT", "Test Prompt")
+def test_train_episode(mock_trajectory_collector_class, mock_reward_prompt):
     """Test training a single episode with the new Trajectory class."""
     # Setup mocks
     mock_collector = MagicMock()
@@ -349,7 +351,11 @@ def test_train_episode(mock_trajectory_collector_class):
     )
     
     # Verify
-    mock_collector.collect_trajectory.assert_called_once_with(batch_size=2, verbose=True)
+    mock_collector.collect_trajectory.assert_called_once_with(
+        query="Test Prompt",
+        num_steps=5,
+        verbose=True
+    )
     learner.compute_trajectory_rewards.assert_called_once_with(mock_trajectory)
     
     # Verify policy update with rewards
@@ -382,7 +388,8 @@ def global_mock_model():
 @patch("src.rl_agent.TrajectoryCollector")
 @patch("src.rl_agent.compute_running_stats")
 @patch("src.rl_agent.logger")
-def test_run_training(mock_logger, mock_compute_stats, mock_trajectory_collector_class, mock_learner_class, mock_language_model, global_mock_model):
+@patch("src.rl_agent.train_episode")
+def test_run_training(mock_train_episode, mock_logger, mock_compute_stats, mock_trajectory_collector_class, mock_learner_class, mock_language_model, global_mock_model):
     """Test the full training loop with baseline model and warm-up period."""
     # Setup mocks
     mock_collector = MagicMock()
@@ -394,18 +401,8 @@ def test_run_training(mock_logger, mock_compute_stats, mock_trajectory_collector
     mock_baseline = MagicMock()
     mock_language_model.return_value = mock_baseline
     
-    # Mock trajectory and rewards
-    mock_trajectory = MagicMock()
-    mock_collector.collect_trajectory.return_value = mock_trajectory
-    
-    mock_rewards = [0.5, 0.6, 0.7]  # Example rewards for three episodes
-    mock_learner.compute_trajectory_rewards.return_value = mock_rewards
-    
-    # Mock running stats calculation
-    mock_compute_stats.return_value = (0.6, 0.1)  # (mean, std)
-    
-    # Mock update_policy for after warm-up
-    mock_learner.update_policy.return_value = {
+    # Mock train_episode output
+    mock_train_episode.return_value = {
         "loss": 0.1,
         "policy_loss": 0.05,
         "kl_loss": 0.05,
@@ -415,24 +412,35 @@ def test_run_training(mock_logger, mock_compute_stats, mock_trajectory_collector
         "filtered_ratio": 0.5
     }
     
-    # Test run_training
-    from src.rl_agent import run_training
-    
-    # Mock database
-    mock_db = [MagicMock(), MagicMock()]
-    
-    # Run with minimal episodes
-    rewards = run_training(
-        model=global_mock_model,
-        database=mock_db,
-        num_episodes=3,  # Minimal for testing
-        batch_size=2,
-        learning_rate=0.001,
-        kl_weight=0.1
-    )
-    
-    # Verify
-    mock_language_model.assert_called_once()
-    mock_trajectory_collector_class.assert_called_once_with(global_mock_model, mock_db)
-    mock_learner_class.assert_called_once()
-    assert len(rewards) == 3  # Should have rewards for all episodes 
+    # Mock KeyValueDatabase.from_file
+    with patch("src.rl_agent.KeyValueDatabase") as mock_db:
+        mock_db.from_file.return_value = [MagicMock(), MagicMock()]
+        
+        # Mock os.makedirs
+        with patch("os.makedirs") as mock_makedirs:
+            # Test run_training
+            from src.rl_agent import run_training
+            
+            # Run with minimal episodes
+            rewards = run_training(
+                model_name="test-model",
+                data_path="test-data",
+                output_dir="test-output",
+                num_episodes=3,  # Minimal for testing
+                batch_size=2,
+                learning_rate=0.001,
+                kl_weight=0.1,
+                verbose=1
+            )
+            
+            # Verify
+            mock_language_model.assert_called_once()
+            mock_trajectory_collector_class.assert_called_once()
+            mock_learner_class.assert_called_once()
+            
+            # Verify train_episode was called the correct number of times
+            assert mock_train_episode.call_count == 3
+            
+            # Verify the rewards list is returned
+            assert len(rewards) == 3
+            assert all(reward == 0.6 for reward in rewards) 

@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Dict, List, Tuple, Any, Optional, Union
 from datetime import datetime
+from pathlib import Path
 
 # Set up logging
 logging.basicConfig(
@@ -188,4 +189,31 @@ def format_reward_context(system_prompt: str, query_key_pairs: str) -> str:
     """
     from src.config import SYSTEM_START, USER_START, EOT_TOKEN
     
-    return f"{SYSTEM_START} {system_prompt} {EOT_TOKEN} {USER_START} {query_key_pairs} {EOT_TOKEN}" 
+    return f"{SYSTEM_START} {system_prompt} {EOT_TOKEN} {USER_START} {query_key_pairs} {EOT_TOKEN}"
+
+def get_device(requested_device: Optional[str] = None) -> torch.device:
+    """
+    Get the appropriate device for tensor operations.
+    
+    Args:
+        requested_device: Optional device string ("cuda", "cpu", or specific CUDA device like "cuda:0")
+                         If None, will use CUDA if available, otherwise CPU.
+    
+    Returns:
+        torch.device: The device to use for tensor operations
+    """
+    # If a specific device is requested, try to use it
+    if requested_device is not None:
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning(f"CUDA requested but not available. Falling back to CPU.")
+            return torch.device("cpu")
+        return torch.device(requested_device)
+    
+    # Otherwise use CUDA if available
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        logger.debug(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+        return device
+    else:
+        logger.debug("CUDA not available. Using CPU.")
+        return torch.device("cpu") 

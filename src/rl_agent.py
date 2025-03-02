@@ -6,8 +6,6 @@ import os
 import torch
 import numpy as np
 import logging
-import json
-import time
 from typing import Dict, List, Tuple, Any, Optional, Union
 from collections import deque
 import bitsandbytes as bnb
@@ -15,28 +13,25 @@ import bitsandbytes as bnb
 from src.config import (
     KL_WEIGHT,
     BATCH_SIZE,
-    QUERY_TOKEN_COUNT,
-    VALUE_TOKEN_COUNT,
     WARMUP_EPISODES,
-    REWARD_SYSTEM_PROMPT
 )
 from src.embeddings import (
-    compute_embeddings, 
-    tokenize_text, 
-    tokenize_text_batch, 
-    extract_attention_activations, 
-    extract_attention_activations_batch,
-    compute_attention_query_embedding,
-    compute_similarity
+    compute_similarity,
+    extract_attention_activations,
+    compute_multihead_similarity
 )
 from src.utils import (
     softmax,
     sample_from_distribution,
-    compute_running_stats
+    compute_running_stats,
+    get_device
 )
 from src.model import LanguageModel, load_language_model
 from src.data import KeyValuePair
 from src.trajectory import Trajectory
+
+# Constants
+REWARD_SYSTEM_PROMPT = "You are a helpful AI assistant that provides accurate and useful information."
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -86,18 +81,19 @@ def select_value_with_attention(
     database: List[KeyValuePair],
     model: LanguageModel,
     temperature: float = 1.0,
-    verbose: bool = False
+    verbose: bool = False,
+    use_multihead: bool = True
 ) -> Tuple[str, str, List[KeyValuePair]]:
     """
-    Select a key-value pair from the database using attention-based similarity.
-    Uses scaled dot product attention (scaled by sqrt(d)) instead of normalization.
+    Select a key-value pair from a database using attention-based similarity.
     
     Args:
-        query: Query string to match against keys
+        query: Query string
         database: List of KeyValuePair objects
         model: Language model for computing embeddings
         temperature: Temperature for softmax sampling (higher = more random)
         verbose: Whether to print debug information
+        use_multihead: Whether to use multi-head attention for similarity calculation
         
     Returns:
         Tuple of (selected_key, selected_value, updated_database)
@@ -105,27 +101,58 @@ def select_value_with_attention(
     if not database:
         return "", "", []
     
-    # Compute query embedding (without normalization)
-    query_embedding = compute_attention_query_embedding(query, model)
+    # Device to use for all tensor operations
+    device = model.device
+    
+    # Process query - tokenize it first
+    query_inputs = model.tokenizer(
+        query,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
+    
+    # Compute query embedding using attention mechanism
+    query_activations = extract_attention_activations(
+        query_inputs["input_ids"], 
+        model, 
+        activation_type="query"
+    )
+    query_embedding = query_activations[0]  # Take first (only) embedding
+    
+    # Add batch dimension to query_embedding
+    query_embedding = query_embedding.unsqueeze(0)  # [embed_dim] -> [1, embed_dim]
     
     # Get all keys from the database
     keys = [pair.key for pair in database]
     key_ids = [pair.key_id for pair in database]
     
-    # Compute key embeddings (without normalization)
-    key_embeddings = {}
-    for i, key in enumerate(keys):
-        key_embedding = compute_attention_query_embedding(key, model)
-        key_embeddings[key_ids[i]] = key_embedding
+    # Prepare key embeddings as a tensor
+    key_embeddings = torch.stack([torch.tensor(pair.key_embedding, device=device) for pair in database])
     
-    # Compute similarities (now using scaled dot product)
-    similarities = compute_similarity(query_embedding, key_embeddings)
+    # Add batch dimension to key_embeddings
+    key_embeddings = key_embeddings.unsqueeze(0)  # [num_keys, embed_dim] -> [1, num_keys, embed_dim]
     
-    # Convert to list for sampling
-    similarity_values = [similarities[key_id] for key_id in key_ids]
+    # For multihead similarity, we need to process each key text separately
+    # For standard similarity, we can directly use the pre-computed key_embeddings
+    if use_multihead:
+        # Compute multi-head similarities using tensor-based API
+        avg_similarities = compute_multihead_similarity(
+            query_embedding=query_embedding,
+            key_embeddings=key_embeddings,
+            model=model,
+            verbose=verbose
+        )
+        # Remove batch dimension from avg_similarities [1, num_keys] -> [num_keys]
+        similarity_values = avg_similarities.squeeze(0).cpu().numpy()
+    else:
+        # Use standard dot product similarity with tensor-based API
+        similarities = compute_similarity(query_embedding, key_embeddings)
+        # Remove batch dimension from similarities [1, num_keys] -> [num_keys]
+        similarity_values = similarities.squeeze(0).cpu().numpy()
     
     # Apply temperature and softmax
-    probabilities = softmax(np.array(similarity_values) / temperature)
+    probabilities = softmax(similarity_values / temperature)
     
     # Sample based on probabilities
     selected_idx = sample_from_distribution(probabilities)
@@ -175,78 +202,65 @@ class TrajectoryCollector:
         
         logger.info(f"Initialized TrajectoryCollector with temperature: {temperature}")
         
-    def collect_trajectory(self, batch_size: int = 1, verbose: bool = False) -> Trajectory:
+    def collect_trajectory(
+        self, 
+        query: str, 
+        num_steps: int = 1, 
+        temperature: float = 1.0,
+        verbose: bool = False,
+        use_multihead: bool = True
+    ) -> Dict[str, Any]:
         """
-        Collect a trajectory by repeatedly generating a query, selecting a key-value pair,
-        and updating the context.
+        Collect a trajectory of key-value pairs from the database using the query as a prompt.
         
         Args:
-            batch_size: Number of trajectories to collect in parallel
+            query: Initial query
+            num_steps: Number of steps to take in the trajectory
+            temperature: Temperature for sampling (higher = more random)
             verbose: Whether to print debug information
+            use_multihead: Whether to use multi-head attention for similarity calculation
             
         Returns:
-            Trajectory object containing the collected steps
+            Dictionary with the trajectory information
         """
-        if batch_size != 1:
-            raise NotImplementedError("Batch size > 1 not yet implemented for trajectory collection")
+        logger.info(f"Collecting trajectory for query: {query}")
+        trajectory = []
         
-        trajectory = Trajectory()
-        context = ""
-        current_db = self.database.copy()
+        # Initial query
+        current_query = query
         
-        # Continue until we've used all key-value pairs or reached max turns
-        max_turns = len(self.database)
-        for turn in range(max_turns):
-            if verbose:
-                logger.info(f"\nTurn {turn + 1}/{max_turns}")
-                logger.info(f"Context length: {len(context)}")
-                logger.info(f"Database size: {len(current_db)}")
-            
-            # Generate query based on current context
-            query = self.model.generate_query(
-                context=context, 
-                temperature=self.temperature
+        # Collect trajectory
+        for step in range(num_steps):
+            # Select a key-value pair (with attention)
+            selected_key, selected_value, _ = select_value_with_attention(
+                current_query, 
+                self.database.data, 
+                self.model,
+                temperature=temperature,
+                verbose=verbose,
+                use_multihead=use_multihead
             )
             
+            # Log the selected key-value pair
             if verbose:
-                logger.info(f"Generated query: {query}")
+                logger.info(f"Step {step} query: {current_query}")
+                logger.info(f"Step {step} selected: {selected_key}")
             
-            # If database is empty, break
-            if not current_db:
-                break
-                
-            # Use attention-based value selection
-            selected_key, selected_value, current_db = select_value_with_attention(
-                query=query,
-                database=current_db,
-                model=self.model,
-                temperature=self.temperature,
-                verbose=verbose
-            )
+            # Add to trajectory
+            trajectory.append({
+                "query": current_query,
+                "key": selected_key,
+                "value": selected_value
+            })
             
-            if verbose:
-                logger.info(f"Selected key: {selected_key}")
-                logger.info(f"Selected value: {selected_value}")
+            # Update the query
+            current_query = selected_value
             
-            # Update context with the new query-value pair
-            if context:
-                # Add separator if needed
-                context += " "
-            context += f"Query: {query} Value: {selected_value}"
-            
-            # Add step to trajectory
-            trajectory.add_step(
-                query=query,
-                key=selected_key,
-                value=selected_value,
-                context=context
-            )
-            
-            # If database is now empty, we're done
-            if not current_db:
-                break
-        
-        return trajectory
+        # Return the trajectory
+        return {
+            "initial_query": query,
+            "steps": trajectory
+        }
 
     def reset(self):
         """Reset the database to its original state."""
@@ -564,6 +578,57 @@ class ReinforcementLearner:
             "filtered_ratio": len(filtered_indices) / len(rewards)
         }
 
+    def train_episode(
+        self, 
+        initial_query: str, 
+        target_answer: str, 
+        num_steps: int = 5,
+        temperature: float = 1.0,
+        update_steps: int = 1,
+        verbose: bool = False,
+        use_multihead: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Train the model for a single episode using the given query and target answer.
+        
+        Args:
+            initial_query: Initial query to start the trajectory
+            target_answer: Target answer to measure reward against
+            num_steps: Number of steps in the trajectory
+            temperature: Temperature for sampling (higher = more random)
+            update_steps: Number of gradient update steps per episode
+            verbose: Whether to print debug information
+            use_multihead: Whether to use multi-head attention for similarity calculation
+            
+        Returns:
+            Dictionary with the training information
+        """
+        # Collect trajectory
+        trajectory = self.collect_trajectory(
+            query=initial_query,
+            num_steps=num_steps,
+            temperature=temperature,
+            verbose=verbose,
+            use_multihead=use_multihead
+        )
+        
+        # Compute rewards
+        rewards = self.compute_trajectory_rewards(trajectory)
+        
+        # Update policy
+        update_stats = self.update_policy(trajectory, rewards)
+        
+        # Combine stats
+        stats = {
+            'reward_mean': np.mean(rewards),
+            'reward_std': np.std(rewards),
+            'reward_min': np.min(rewards),
+            'reward_max': np.max(rewards),
+            **update_stats
+        }
+        
+        return stats
+
 def train_episode(
     collector: TrajectoryCollector,
     learner: ReinforcementLearner,
@@ -584,8 +649,12 @@ def train_episode(
     Returns:
         Dictionary of training metrics
     """
-    # Collect batched trajectory
-    trajectory = collector.collect_trajectory(batch_size=batch_size, verbose=verbose)
+    # Collect trajectory
+    trajectory = collector.collect_trajectory(
+        query=REWARD_SYSTEM_PROMPT,
+        num_steps=5,
+        verbose=verbose
+    )
     
     # Compute rewards
     rewards = learner.compute_trajectory_rewards(trajectory)
@@ -605,134 +674,91 @@ def train_episode(
     return stats
 
 def run_training(
-    model: 'LanguageModel',
-    database: 'List[KeyValuePair]',
-    num_episodes: int = 50,
-    batch_size: int = BATCH_SIZE,
-    learning_rate: float = 0.0001,
-    kl_weight: float = KL_WEIGHT,
-    disable_checkpoints: bool = False,
-    verbose: int = 0
-) -> List[float]:
+    model_name: str,
+    data_path: str,
+    output_dir: str,
+    num_episodes: int = 10,
+    batch_size: int = 1,
+    log_interval: int = 1,
+    save_interval: int = 5,
+    temperature: float = 1.0,
+    learning_rate: float = 1e-5,
+    kl_weight: float = 0.1,
+    verbose: int = 1,
+    use_multihead: bool = True,
+    device: Optional[str] = None
+) -> None:
     """
-    Run training for the reinforcement learning agent.
+    Run the reinforcement learning training loop.
     
     Args:
-        model: Language model to train
-        database: List of KeyValuePair objects
-        num_episodes: Number of episodes to train
-        batch_size: Number of trajectories per batch
-        learning_rate: Learning rate for optimizer
-        kl_weight: Weight for KL divergence regularization
-        disable_checkpoints: Whether to disable saving model checkpoints
-        verbose: Verbosity level (0=quiet, 1=normal, 2=debug, 3=trace)
-        
-    Returns:
-        List of rewards for each episode
+        model_name: Name of the HuggingFace model to use
+        data_path: Path to the dataset
+        output_dir: Directory to save models and logs
+        num_episodes: Number of episodes to train for
+        batch_size: Batch size for training
+        log_interval: Log interval (in episodes)
+        save_interval: Save interval (in episodes)
+        temperature: Temperature for sampling
+        learning_rate: Learning rate for policy updates
+        kl_weight: Weight for KL penalty in the loss function
+        verbose: Verbosity level (0=quiet, 1=info, 2=debug)
+        use_multihead: Whether to use multi-head attention
+        device: Device to use for model and tensors (None for auto-detection)
     """
-    # Initialize baseline model - use a fresh instance of the same pretrained model
-    baseline_model = LanguageModel(
-        model_name=model.model_name,
-        device=model.device
-    )
-    logger.info("Initialized baseline model for reward normalization")
+    # Set up logging
+    setup_logging(verbose)
     
-    # Initialize trajectory collector
-    collector = TrajectoryCollector(model, database)
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Initialize reinforcement learner
-    learner = ReinforcementLearner(
-        model=model,
-        baseline_model=baseline_model,
-        learning_rate=learning_rate,
-        kl_weight=kl_weight
-    )
+    # Get the appropriate device for training
+    device_to_use = get_device(device)
+    device_str = str(device_to_use)
+    logger.info(f"Using device: {device_str}")
     
-    # Track rewards
-    episode_rewards = []
-    running_reward_stats = {"mean": 0.0, "std": 1.0}
+    # Initialize components
+    logger.info(f"Loading model: {model_name}")
+    model = LanguageModel(model_name, device=device_str)
     
-    # Track best model
-    best_reward = float("-inf")
+    logger.info(f"Loading dataset: {data_path}")
+    database = KeyValueDatabase.from_file(data_path)
+    
+    # Initialize collector and learner
+    collector = TrajectoryCollector(model, database, temperature=temperature)
+    learner = ReinforcementLearner(model, learning_rate=learning_rate, kl_weight=kl_weight)
     
     # Training loop
-    for episode in range(1, num_episodes + 1):
-        start_time = time.time()
-        
-        # Warm-up period: no policy updates
-        if episode <= WARMUP_EPISODES:
-            logger.info(f"Episode {episode}/{num_episodes} (warm-up)")
-            # Collect trajectories but don't update policy
-            trajectory = collector.collect_trajectory(
-                batch_size=batch_size, 
-                verbose=(verbose >= 3)  # Only show detailed trajectory logs at trace level
-            )
-            rewards = learner.compute_trajectory_rewards(trajectory)
-            episode_reward = np.mean(rewards)
-            duration = time.time() - start_time
-            
-            logger.info(f"Episode {episode}: Reward = {episode_reward:.4f}, Duration = {duration:.2f}s")
-            
-            # Update reward stats
-            if episode == 1:
-                running_reward_stats["mean"] = episode_reward
-                running_reward_stats["std"] = 1.0
-            else:
-                # Update moving average of rewards for filtering
-                running_reward_stats = compute_running_stats(
-                    rewards=episode_rewards + [episode_reward], 
-                    window_size=max(1, min(len(episode_rewards), 5))
-                )
-            
-            episode_rewards.append(episode_reward)
-            continue
-        
-        # Regular episodes
-        logger.info(f"Episode {episode}/{num_episodes}")
+    logger.info(f"Starting training for {num_episodes} episodes")
+    rewards_list = []
+    for episode in range(num_episodes):
+        logger.info(f"Episode {episode+1}/{num_episodes}")
         
         # Train for one episode
         stats = train_episode(
             collector=collector,
             learner=learner,
             batch_size=batch_size,
-            verbose=(verbose >= 2)  # Show detailed logs at debug level or higher
+            verbose=(verbose >= 2),  # Show detailed logs at debug level or higher
         )
         
-        # Extract reward
-        episode_reward = stats["reward_mean"]
-        episode_rewards.append(episode_reward)
+        # Store rewards
+        rewards_list.append(stats.get('reward_mean', 0.0))
         
-        # Update running stats for standardization
-        running_reward_stats = compute_running_stats(
-            rewards=episode_rewards, 
-            window_size=max(1, min(len(episode_rewards), 5))
-        )
+        # Log statistics
+        if (episode + 1) % log_interval == 0:
+            log_stats(stats, episode)
         
-        # Calculate duration
-        duration = time.time() - start_time
-        
-        # Log metrics
-        logger.info(
-            f"Episode {episode}: Reward = {episode_reward:.4f}, "
-            f"Loss = {stats.get('loss', 0):.4f}, "
-            f"Duration = {duration:.2f}s"
-        )
-        
-        # Detailed logging at debug level or higher
-        if verbose >= 2:
-            logger.debug(
-                f"Episode {episode} details: Policy loss = {stats.get('policy_loss', 0):.4f}, "
-                f"KL loss = {stats.get('kl_loss', 0):.4f}, "
-                f"Gradient norm = {stats.get('grad_norm', 0):.4f}, "
-                f"Filtered ratio = {stats.get('filtered_ratio', 0):.2f}"
-            )
-        
-        # Track best model
-        if episode_reward > best_reward and not disable_checkpoints:
-            best_reward = episode_reward
-            # Save checkpoint
-            model_path = f"checkpoints/episode_{episode}_reward_{episode_reward:.4f}"
-            model.save_checkpoint(model_path)
-            logger.info(f"New best model saved to {model_path}")
+        # Save model
+        if (episode + 1) % save_interval == 0:
+            save_path = os.path.join(output_dir, f"model_episode_{episode+1}")
+            model.save(save_path)
+            logger.info(f"Saved model to {save_path}")
     
-    return episode_rewards 
+    # Save final model
+    final_path = os.path.join(output_dir, "model_final")
+    model.save(final_path)
+    logger.info(f"Saved final model to {final_path}")
+    logger.info("Training complete!")
+    
+    return rewards_list 

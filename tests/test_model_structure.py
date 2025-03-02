@@ -49,13 +49,17 @@ def test_model_inference(language_model):
     
     # Create input for a short test
     input_text = "Hello, world!"
-    inputs = model.tokenizer(input_text, return_tensors="pt").to(model.device)
+    inputs = model.tokenizer(input_text, return_tensors="pt")
+    
+    # Move inputs to the correct device
+    input_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs["attention_mask"].to(model.device)
     
     # Run model with output_hidden_states=True
     with torch.inference_mode():
         outputs = model.model(
-            input_ids=inputs.input_ids,
-            attention_mask=inputs.attention_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             output_hidden_states=True
         )
     
@@ -69,4 +73,4 @@ def test_model_inference(language_model):
         assert isinstance(layer_output, torch.Tensor)
         assert layer_output.ndim == 3  # (batch_size, sequence_length, hidden_size)
         assert layer_output.shape[0] == 1  # batch_size = 1
-        assert layer_output.shape[1] == inputs.input_ids.shape[1]  # sequence_length 
+        assert layer_output.shape[1] == inputs["input_ids"].shape[1]  # sequence_length 

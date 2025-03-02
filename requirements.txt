@@ -7,4 +7,5 @@ wandb>=0.15.0
 matplotlib>=3.7.0
 sentence-transformers>=2.2.2  # Alternative for embeddings if needed
 datasets>=2.14.0  # For Huggingface datasets and Wikipedia articles
-bitsandbytes>=0.43.0  # For 8-bit Adam optimizer 
+bitsandbytes>=0.43.0  # For 8-bit Adam optimizer
+torchtyping>=0.1.4  # For tensor shape typings 

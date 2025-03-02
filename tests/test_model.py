@@ -1,15 +1,13 @@
 """
 Tests for the model module.
 """
-
-import os
 import pytest
 import torch
 import numpy as np
 from unittest.mock import patch, MagicMock
 
 # Import the module to test
-from src.model import LanguageModel, load_language_model
+from src.model import LanguageModel
 from src.trajectory import Trajectory
 
 # Skip tests that require GPU if not available

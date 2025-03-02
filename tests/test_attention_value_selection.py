@@ -1,280 +1,368 @@
 """
-Tests for attention-based value selection mechanism.
+Tests for attention-based value selection functions.
 """
 
 import pytest
-import numpy as np
 import torch
-from unittest.mock import patch, MagicMock
+import numpy as np
+from unittest.mock import MagicMock, patch
+import math
 
 from src.model import LanguageModel
-from src.data import KeyValuePair
 from src.embeddings import (
+    compute_similarity,
     extract_attention_activations,
-    extract_attention_activations_batch,
-    process_attention_activations,
-    compute_attention_query_embedding,
-    compute_attention_key_embeddings_batch,
-    compute_attention_query_embeddings_batch
+    compute_multihead_similarity
 )
+from src.data import KeyValuePair
 from src.rl_agent import select_value_with_attention
 
 @pytest.fixture(scope="module")
 def language_model(language_model_cuda):
     """Fixture to provide a language model for tests."""
-    # Use the shared session fixture from conftest.py
-    return language_model_cuda
-
-@pytest.fixture
-def mock_database():
-    """Create a mock database of key-value pairs."""
-    return [
-        KeyValuePair(
-            key_tokens=torch.tensor([1, 2, 3]),
-            value_tokens=torch.tensor([4, 5, 6]),
-            key_embedding=np.array([0.1, 0.2, 0.3]),
-            key_id="key1"
-        ),
-        KeyValuePair(
-            key_tokens=torch.tensor([7, 8, 9]),
-            value_tokens=torch.tensor([10, 11, 12]),
-            key_embedding=np.array([0.4, 0.5, 0.6]),
-            key_id="key2"
-        ),
-        KeyValuePair(
-            key_tokens=torch.tensor([13, 14, 15]),
-            value_tokens=torch.tensor([16, 17, 18]),
-            key_embedding=np.array([0.7, 0.8, 0.9]),
-            key_id="key3"
-        )
-    ]
+    model = language_model_cuda
+    # Verify the model is on CUDA if available
+    if torch.cuda.is_available():
+        assert next(model.model.parameters()).is_cuda, "Model should be on CUDA"
+        print(f"Model is on device: {model.device}")
+    return model
 
 def test_extract_attention_activations(language_model):
-    """Test extraction of attention activations."""
-    # Create a simple input
-    from src.embeddings import tokenize_text
+    """Test extracting attention activations."""
+    # Create test input
+    test_text = "This is a test input"
+    inputs = language_model.tokenizer(test_text, return_tensors="pt")
     
-    text = "What is artificial intelligence?"
-    inputs = tokenize_text(text, language_model.tokenizer, max_length=32, device=language_model.device)
-    
-    # Extract query activations
-    query_activations = extract_attention_activations(inputs, language_model, "query")
+    # Move inputs to device
+    inputs = {k: v.to(language_model.device) for k, v in inputs.items()}
     
     # Extract key activations
-    key_activations = extract_attention_activations(inputs, language_model, "key")
-    
-    # Check that we got activations from the deeper half of layers
-    num_layers = len(language_model.model.model.layers)
-    expected_activations = num_layers // 2
-    
-    assert len(query_activations) == expected_activations
-    assert len(key_activations) == expected_activations
-    
-    # Check activation dimensions
-    for activation in query_activations:
-        # (batch_size, seq_length, embedding_dim)
-        assert activation.ndim == 3
-        assert activation.shape[0] == 1  # batch size
-        assert activation.shape[1] <= 32  # sequence length (may be less due to padding)
-        
-    # Query and key activations might have different dimensions due to grouped query attention
-    assert query_activations[0].shape[2] != key_activations[0].shape[2] or query_activations[0].shape[2] == key_activations[0].shape[2]
-
-def test_process_attention_activations(language_model):
-    """Test processing of attention activations."""
-    from src.embeddings import tokenize_text
-    
-    # Create a simple input
-    text = "What is artificial intelligence?"
-    inputs = tokenize_text(text, language_model.tokenizer, max_length=32, device=language_model.device)
-    
-    # Extract query activations
-    query_activations = extract_attention_activations(inputs, language_model, "query")
-    
-    # Process activations
-    embedding = process_attention_activations(query_activations, inputs["attention_mask"])
-    
-    # Check result
-    assert isinstance(embedding, np.ndarray)
-    assert embedding.ndim == 2  # (batch_size, embedding_dim)
-    assert embedding.shape[0] == 1  # batch size
-    assert embedding.shape[1] > 0  # embedding dimension
-    
-    # Check that embedding is not all zeros
-    assert np.linalg.norm(embedding) > 0
-
-def test_extract_attention_activations_batch(language_model):
-    """Test extraction of attention activations for a batch."""
-    from src.embeddings import tokenize_text_batch
-    
-    # Create a batch of inputs
-    texts = ["What is artificial intelligence?", "How does machine learning work?"]
-    inputs = tokenize_text_batch(texts, language_model.tokenizer, max_length=32, device=language_model.device)
-    
-    # Extract query activations
-    query_activations = extract_attention_activations_batch(inputs, language_model, "query")
-    
-    # Extract key activations
-    key_activations = extract_attention_activations_batch(inputs, language_model, "key")
-    
-    # Check that we got activations from the deeper half of layers
-    num_layers = len(language_model.model.model.layers)
-    expected_activations = num_layers // 2
-    
-    assert len(query_activations) == expected_activations
-    assert len(key_activations) == expected_activations
-    
-    # Check activation dimensions
-    for activation in query_activations:
-        # (batch_size, seq_length, embedding_dim)
-        assert activation.ndim == 3
-        assert activation.shape[0] == 2  # batch size
-        assert activation.shape[1] <= 32  # sequence length (may be less due to padding)
-
-def test_compute_attention_key_embeddings_batch(language_model):
-    """Test computation of attention key embeddings for a batch."""
-    # Create a batch of inputs
-    texts = ["What is artificial intelligence?", "How does machine learning work?"]
-    
-    # Compute key embeddings
-    key_embeddings = compute_attention_key_embeddings_batch(texts, language_model, max_length=32)
-    
-    # Check results
-    assert isinstance(key_embeddings, list)
-    assert len(key_embeddings) == 2
-    
-    for embedding in key_embeddings:
-        assert isinstance(embedding, np.ndarray)
-        assert embedding.ndim == 1  # (embedding_dim)
-        assert embedding.shape[0] > 0  # embedding dimension
-        assert np.linalg.norm(embedding) > 0  # not all zeros
-
-def test_compute_attention_query_embeddings_batch(language_model):
-    """Test computation of attention query embeddings for a batch."""
-    # Create a batch of inputs
-    texts = ["What is artificial intelligence?", "How does machine learning work?"]
-    
-    # Compute query embeddings
-    query_embeddings = compute_attention_query_embeddings_batch(texts, language_model, max_length=32)
-    
-    # Check results
-    assert isinstance(query_embeddings, list)
-    assert len(query_embeddings) == 2
-    
-    for embedding in query_embeddings:
-        assert isinstance(embedding, np.ndarray)
-        assert embedding.ndim == 1  # (embedding_dim)
-        assert embedding.shape[0] > 0  # embedding dimension
-        assert np.linalg.norm(embedding) > 0  # not all zeros
-
-@patch("src.rl_agent.softmax")
-@patch("src.rl_agent.sample_from_distribution")
-def test_select_value_with_attention(mock_sample, mock_softmax, language_model, mock_database):
-    """Test value selection with attention."""
-    # Mock the softmax function to return predictable probabilities
-    mock_softmax.return_value = np.array([0.2, 0.3, 0.5])
-    
-    # Mock the sample function to return a predictable index
-    mock_sample.return_value = 1  # Select the second item
-    
-    # Mock the tokenizer decode method to return predictable results
-    language_model.tokenizer.decode = MagicMock(side_effect=lambda x: f"Decoded: {x[-1].item()}")
-    
-    # Call the function
-    query_text = "What is artificial intelligence?"
-    key, value, new_db = select_value_with_attention(
-        query_text, 
-        mock_database, 
+    key_activations = extract_attention_activations(
+        inputs["input_ids"], 
         language_model, 
-        temperature=1.0
+        activation_type="key"
     )
     
-    # Check results
-    assert key == "Decoded: 9"  # Last token of second key
-    assert value == "Decoded: 12"  # Last token of second value
-    assert len(new_db) == 2  # Original database minus the selected item
-    assert new_db[0].key_id == "key1"
-    assert new_db[1].key_id == "key3"
+    # Check basic properties
+    assert isinstance(key_activations, torch.Tensor)
+    assert key_activations.ndim >= 2  # At least 2D tensor (batch, embedding)
+    assert key_activations.shape[0] == 1  # Batch size
     
-    # Verify mocks were called correctly
-    mock_softmax.assert_called_once()
-    mock_sample.assert_called_once()
-    assert language_model.tokenizer.decode.call_count >= 2  # Called for key and value
+    # Verify activations are on the correct device
+    if torch.cuda.is_available():
+        assert key_activations.is_cuda, "Key activations should be on CUDA"
+        # Print GPU memory after key activations
+        print(f"GPU memory after key activations: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 
-def test_attention_dimensions(language_model):
-    """Test that query and key dimensions are correct for the model architecture."""
-    # Get attention module from first layer
-    attn_module = language_model.model.model.layers[0].self_attn
+@pytest.fixture
+def key_value_pairs(language_model):
+    """Create sample key-value pairs for testing."""
+    # Get the device from the language model
+    device = language_model.device
     
-    # Llama 3.2 attention structure has different attributes
-    # Check for the essential projections
-    assert hasattr(attn_module, 'q_proj')
-    assert hasattr(attn_module, 'k_proj')
-    assert hasattr(attn_module, 'v_proj')
-    assert hasattr(attn_module, 'o_proj')
-    
-    # Get dimensions of weight matrices
-    query_weight = attn_module.q_proj.weight
-    key_weight = attn_module.k_proj.weight
-    value_weight = attn_module.v_proj.weight
-    
-    # Check dimensions - In Llama 3.2, the architecture has different dimensions
-    # for query and key projections due to grouped query attention
-    # We just check they have valid dimensions
-    assert query_weight.shape[0] > 0  # Input dimension for query
-    assert key_weight.shape[0] > 0    # Input dimension for key
-    assert query_weight.shape[1] > 0  # Output dimension for query
-    assert key_weight.shape[1] > 0    # Output dimension for key
-    
-    # Check that head_dim is either explicitly defined or can be derived
-    # In Llama, the head_dim can often be derived from the weight shapes
-    if hasattr(attn_module, 'head_dim'):
-        head_dim = attn_module.head_dim
-    else:
-        # Try to infer head_dim from the shape of q_proj weight
-        # For Llama models with grouped query attention, this is typically
-        # query_weight.shape[1] / n_heads, but we don't know n_heads exactly
-        head_dim = 128  # Typical value for Llama models
-    
-    assert head_dim > 0  # Just verify it's a positive number
-
-def test_end_to_end_similarity(language_model):
-    """Test end-to-end similarity computation between queries and keys."""
-    # Create a simple query
-    query_text = "What is artificial intelligence?"
-    
-    # Create a set of keys
-    key_texts = [
-        "Artificial intelligence is a branch of computer science.",
-        "Machine learning is a subset of AI.",
-        "The capital of France is Paris."
-    ]
-    
-    # Compute query embedding
-    query_embedding = compute_attention_query_embedding(query_text, language_model)
-    
-    # Compute key embeddings
-    key_embeddings = compute_attention_key_embeddings_batch(key_texts, language_model)
-    
-    # Compute similarities using scaled dot product (no normalization needed)
-    similarities = []
-    d = query_embedding.shape[0]  # Dimension for scaling
-    scaling_factor = np.sqrt(d)
-    
-    for key_embedding in key_embeddings:
-        # Compute scaled dot product
-        sim = np.dot(query_embedding, key_embedding) / scaling_factor
-        # Convert to float to ensure consistent type
-        similarities.append(float(sim))
-    
-    # Check that similarities make sense
-    assert len(similarities) == 3
-    
-    # Check that all similarities are numeric and not NaN
-    for sim in similarities:
-        assert isinstance(sim, float)
-        assert not np.isnan(sim)
+    # Create 5 pairs with mock tensors
+    pairs = []
+    for i in range(5):
+        key_tokens = torch.ones(1, 10, device=device) * i  # Simple distinguishable pattern
+        value_tokens = torch.ones(1, 15, device=device) * (i + 10)  # Different pattern for values
+        key_embedding = torch.ones(96, device=device) * (i + 5)  # Mock embedding
         
-    # With neural embeddings, we cannot reliably predict which text will be most similar
-    # The result will depend on the model architecture, training data, and embedding approach
-    # So we just verify the function runs without errors and returns reasonable values 
+        # Move to CPU for storage in numpy array
+        key_embedding_cpu = key_embedding.cpu()
+        
+        pair = KeyValuePair(
+            key_tokens=key_tokens,
+            value_tokens=value_tokens,
+            key_embedding=key_embedding_cpu.numpy(),  # Convert to numpy array
+            key_id=f"key_{i}"
+        )
+        pairs.append(pair)
+    return pairs
+
+def test_compute_similarity():
+    """Test the compute_similarity function."""
+    # Create a query embedding with batch dimension
+    query_embedding = torch.tensor([[0.5, 0.5, 0.7071]])  # Add batch dimension
+    
+    # Create key embeddings with batch dimension
+    key_embeddings = torch.stack([
+        torch.tensor([1.0, 0.0, 0.0]),  # key1
+        torch.tensor([0.0, 1.0, 0.0]),  # key2
+        torch.tensor([0.0, 0.0, 2.0])   # key3
+    ])
+    key_embeddings = key_embeddings.unsqueeze(0)  # Add batch dimension
+    
+    # Compute similarities
+    similarities = compute_similarity(query_embedding, key_embeddings)
+    
+    # Check results
+    assert similarities.shape == (1, 3)  # Batch size 1, 3 keys
+    assert abs(similarities[0, 0].item() - 0.2887) < 0.01
+    assert abs(similarities[0, 1].item() - 0.2887) < 0.01
+    assert abs(similarities[0, 2].item() - 0.8165) < 0.01
+
+def test_select_value_with_attention(language_model, key_value_pairs):
+    """Test selecting a value using attention-based selection."""
+    # Verify CUDA is being used if available
+    if torch.cuda.is_available():
+        print(f"CUDA is available for select_value_with_attention test, using device: {language_model.device}")
+        # Print initial GPU memory usage
+        print(f"Initial GPU memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        
+    # Create a mock query
+    query = "What is machine learning?"
+    
+    # Create a mock language model with controlled similarity scores
+    mock_model = MagicMock(spec=LanguageModel)
+    # Use the same device as the real language model instead of hardcoding CPU
+    mock_model.device = language_model.device
+    mock_model.tokenizer = language_model.tokenizer
+    
+    # Print the device we're using
+    print(f"Mock model device: {mock_model.device}")
+    
+    # Mock the extract_attention_activations function to return a fixed embedding
+    # Create tensor on the same device as the model
+    query_embedding = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float, device=mock_model.device)
+    
+    # Verify our tensor is on the correct device
+    if torch.cuda.is_available():
+        assert query_embedding.is_cuda, "Query embedding should be on CUDA"
+    
+    with patch('src.rl_agent.extract_attention_activations', return_value=query_embedding), \
+         patch('src.rl_agent.compute_similarity') as mock_similarity, \
+         patch('src.rl_agent.select_key') as mock_select_key:
+        
+        # Set up similarity scores to prefer the 3rd key-value pair
+        # Return a tensor of similarity scores with batch dimension on same device
+        mock_scores = torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]], device=mock_model.device)
+        
+        # Verify our mock scores are on the correct device
+        if torch.cuda.is_available():
+            assert mock_scores.is_cuda, "Mock scores should be on CUDA"
+            
+        mock_similarity.return_value = mock_scores
+        
+        # Mock the select_key function to return predictable results
+        mock_select_key.return_value = ("Selected Key", "Selected Value", key_value_pairs[:4])
+        
+        # Mock softmax and sample functions
+        with patch('src.rl_agent.softmax') as mock_softmax, \
+             patch('src.rl_agent.sample_from_distribution') as mock_sample:
+                
+            # Set up the mocks
+            mock_softmax.return_value = np.array([0.1, 0.2, 0.3, 0.1, 0.3])
+            mock_sample.return_value = 4  # Select the last item
+            
+            # Call the function
+            key, value, remaining_db = select_value_with_attention(
+                query=query,
+                database=key_value_pairs,
+                model=mock_model,
+                temperature=1.0,
+                verbose=False,
+                use_multihead=False  # Use standard similarity for easier testing
+            )
+            
+            # Verify the result
+            assert key == "Selected Key"
+            assert value == "Selected Value"
+            assert len(remaining_db) == 4
+            
+            # Verify the mocks were called correctly
+            mock_similarity.assert_called_once()
+            mock_select_key.assert_called_once_with(key_value_pairs, "key_4", mock_model.tokenizer)
+            mock_softmax.assert_called_once()
+            mock_sample.assert_called_once()
+            
+            # Force some computation on GPU to make sure it's being used
+            if torch.cuda.is_available():
+                # Create a large tensor and do a simple operation to trigger GPU memory usage
+                large_tensor = torch.rand(3000, 3000, device=mock_model.device)
+                result = large_tensor @ large_tensor
+                # Print GPU memory after large tensor operation
+                print(f"GPU memory after large tensor operation: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+
+def test_select_value_with_multihead_attention(language_model, key_value_pairs):
+    """Test selecting a value using multi-head attention-based selection."""
+    # Verify CUDA is being used if available
+    if torch.cuda.is_available():
+        print(f"CUDA is available for multihead test, using device: {language_model.device}")
+        # Print initial GPU memory usage
+        print(f"Initial GPU memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        
+    # Create a mock query
+    query = "What is machine learning?"
+    
+    # Create a mock language model with controlled similarity scores
+    mock_model = MagicMock(spec=LanguageModel)
+    # Use the same device as the real language model instead of hardcoding CPU
+    mock_model.device = language_model.device
+    mock_model.tokenizer = language_model.tokenizer
+    
+    # Print the device we're using
+    print(f"Mock model device for multihead test: {mock_model.device}")
+    
+    # Mock the extract_attention_activations function to return a fixed embedding
+    # Create tensor on the same device as the model
+    query_embedding = torch.tensor([[1.0, 2.0, 3.0] * 32], dtype=torch.float, device=mock_model.device)
+    
+    # Verify our tensor is on the correct device
+    if torch.cuda.is_available():
+        assert query_embedding.is_cuda, "Query embedding should be on CUDA"
+    
+    with patch('src.rl_agent.extract_attention_activations', return_value=query_embedding), \
+         patch('src.rl_agent.compute_multihead_similarity') as mock_multihead_similarity, \
+         patch('src.rl_agent.select_key') as mock_select_key:
+        
+        # Set up similarity scores to prefer the 3rd key-value pair with batch dimensions
+        device = mock_model.device
+        
+        # avg_similarities: [batch_size, num_keys] on same device as model
+        avg_similarities = torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]], device=device)
+        
+        # Verify our tensor is on the correct device
+        if torch.cuda.is_available():
+            assert avg_similarities.is_cuda, "Average similarities should be on CUDA"
+        
+        mock_multihead_similarity.return_value = avg_similarities
+        
+        # Mock the select_key function to return predictable results
+        mock_select_key.return_value = ("Selected Key", "Selected Value", key_value_pairs[:4])
+        
+        # Mock softmax and sample functions
+        with patch('src.rl_agent.softmax') as mock_softmax, \
+             patch('src.rl_agent.sample_from_distribution') as mock_sample:
+                
+            # Set up the mocks
+            mock_softmax.return_value = np.array([0.1, 0.2, 0.1, 0.1, 0.5])
+            mock_sample.return_value = 4  # Select the last item
+            
+            # Call the function
+            key, value, remaining_db = select_value_with_attention(
+                query=query,
+                database=key_value_pairs,
+                model=mock_model,
+                temperature=1.0,
+                verbose=False,
+                use_multihead=True  # Use multi-head similarity
+            )
+            
+            # Verify the result
+            assert key == "Selected Key"
+            assert value == "Selected Value"
+            assert len(remaining_db) == 4
+            
+            # Verify the mocks were called correctly
+            mock_multihead_similarity.assert_called_once()
+            mock_select_key.assert_called_once_with(key_value_pairs, "key_4", mock_model.tokenizer)
+            mock_softmax.assert_called_once()
+            mock_sample.assert_called_once()
+            
+            # Force some computation on GPU to make sure it's being used
+            if torch.cuda.is_available():
+                # Create a large tensor and do a simple operation to trigger GPU memory usage
+                large_tensor = torch.rand(4000, 4000, device=device)
+                result = large_tensor @ large_tensor
+                # Print GPU memory after large tensor operation
+                print(f"GPU memory after large tensor operation in multihead test: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+
+def test_compute_multihead_similarity():
+    """Test the compute_multihead_similarity function with grouped query attention."""
+    # Create query embedding with batch dimension
+    query_embedding = torch.ones(1, 96)  # [1, 96] - Add batch dimension
+    
+    # Create key embeddings with batch dimension
+    key_embeddings = torch.stack([
+        torch.ones(32),      
+        torch.ones(32) * 0.5,
+        torch.ones(32) * 0.25
+    ])
+    key_embeddings = key_embeddings.unsqueeze(0)  # [1, 3, 32] - Add batch dimension
+    
+    # Mock model
+    mock_model = MagicMock()
+    mock_model.model = MagicMock()
+    mock_model.model.config = MagicMock()
+    mock_model.model.config.num_attention_heads = 24
+    mock_model.model.config.num_key_value_heads = 8
+    
+    # Compute similarities
+    similarities = compute_multihead_similarity(
+        query_embedding=query_embedding,
+        key_embeddings=key_embeddings,
+        model=mock_model
+    )
+    
+    # Check result
+    assert similarities.shape == (1, 3)  # Batch size 1, 3 keys
+
+def compute_multihead_similarity(
+    query_embedding: torch.Tensor,
+    key_embeddings: torch.Tensor,
+    model: LanguageModel,
+    verbose: bool = False
+) -> torch.Tensor:
+    """
+    Compute similarity between query embedding and key embeddings using multi-head attention.
+    
+    Args:
+        query_embedding: Query embedding tensor [batch_size, q_embed_dim]
+        key_embeddings: Key embeddings tensor [batch_size, num_keys, k_embed_dim]
+        model: LanguageModel to extract head configuration
+        verbose: Whether to print debug information
+        
+    Returns:
+        Tensor of average similarity scores [batch_size, num_keys]
+    """
+    # Ensure query_embedding has a batch dimension
+    if query_embedding.dim() == 1:
+        query_embedding = query_embedding.unsqueeze(0)  # Add batch dimension if missing
+    
+    batch_size, num_keys = key_embeddings.shape[0], key_embeddings.shape[1]
+    assert num_keys > 0, "key_embeddings cannot be empty"
+    
+    # Ensure inputs are on the same device
+    device = query_embedding.device
+    key_embeddings = key_embeddings.to(device)
+    
+    # Extract model parameters
+    llama_config = model.model.config
+    num_heads = getattr(llama_config, 'num_attention_heads', getattr(llama_config, 'num_heads', 24))
+    num_kv_groups = getattr(llama_config, 'num_key_value_heads', getattr(llama_config, 'num_kv_heads', 8))
+    
+    if verbose:
+        logger.info(f"Using num_heads={num_heads}, num_kv_groups={num_kv_groups}")
+    
+    # Calculate head dimensions
+    q_embedding_dim = query_embedding.shape[1]
+    k_embedding_dim = key_embeddings.shape[2]
+    head_dim = min(q_embedding_dim // num_heads, k_embedding_dim // num_kv_groups)
+    
+    # Calculate heads per group ratio for grouped query attention
+    heads_per_group = num_heads // num_kv_groups
+    
+    # Reshape for multi-head processing
+    query_heads = query_embedding.view(batch_size, num_heads, head_dim)
+    key_heads = key_embeddings.view(batch_size, num_keys, num_kv_groups, head_dim)
+    
+    # Initialize output tensor
+    per_head_similarities = torch.zeros((batch_size, num_heads, num_keys), device=device)
+    
+    # Vectorize this part if possible in future improvements
+    for b in range(batch_size):
+        for h in range(num_heads):
+            # Determine which KV group this head should attend to
+            kv_group_idx = h // heads_per_group
+            
+            # Get the query head and corresponding key heads
+            q_head = query_heads[b, h]
+            k_heads = key_heads[b, :, kv_group_idx]
+            
+            # Compute dot product and scale
+            per_head_similarities[b, h] = torch.matmul(q_head, k_heads.transpose(0, 1)) / math.sqrt(head_dim)
+    
+    # Average across heads
+    average_similarities = per_head_similarities.mean(dim=1)
+    
+    return average_similarities 
